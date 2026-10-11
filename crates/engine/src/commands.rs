@@ -951,7 +951,15 @@ fn build() -> Vec<CommandSpec> {
                         Err(e) => errors.push(format!("{path}: {e}")),
                     },
                     Ok(b) => {
-                        if let Some(fmt) = crate::captions::detect(&path, &b) {
+                        if crate::interchange::is_premiere(&b) {
+                            match crate::interchange::import_premiere(s, &path, &b, bin) {
+                                Ok(r) => {
+                                    sequences.extend(r["sequences"].as_array().cloned().unwrap_or_default());
+                                    reports.push(r);
+                                }
+                                Err(e) => errors.push(format!("{path}: {e}")),
+                            }
+                        } else if let Some(fmt) = crate::captions::detect(&path, &b) {
                             match crate::captions::import(s, &path, &b, fmt, None) {
                                 Ok(r) => reports.push(r),
                                 Err(e) => errors.push(format!("{path}: {e}")),
@@ -3614,6 +3622,10 @@ fn name_project(p: &mut filmcraft_project::Project, name: String) {
 }
 
 fn write_project(s: &mut Session, path: &str, adopt: bool) -> Result<Value> {
+    // A FilmCraft project written over a Premiere Pro one would destroy the user's Premiere work.
+    if crate::interchange::is_premiere_path(path) {
+        return Err(EngineError::Other(format!("{path}: FilmCraft does not write Premiere Pro projects; save as a FilmCraft project (.fcproj)")));
+    }
     let t0 = web_time::Instant::now();
     // Save As renames the project after its new file (not an edit: no undo step, not dirty).
     if adopt
@@ -3679,6 +3691,9 @@ fn install_project(s: &mut Session, proj: filmcraft_project::Project, path: Opti
 
 fn open_project(s: &mut Session, path: &str) -> Result<Value> {
     let bytes = s.services.read_file(path).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+    if crate::interchange::is_premiere(&bytes) {
+        return open_premiere(s, path, &bytes);
+    }
     let loaded = filmcraft_format::decode(&bytes).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
     let (from, migrated) = (loaded.schema_version, loaded.migrated());
     install_project(s, loaded.project, Some(path.to_string()), true);
@@ -3696,6 +3711,37 @@ fn open_project(s: &mut Session, path: &str) -> Result<Value> {
     }
     let missing = crate::relink::on_open(s);
     Ok(json!({"path": path, "schemaVersion": from, "migrated": migrated, "missingMedia": missing}))
+}
+
+/// Open a Premiere Pro project as the session's project. It has no FilmCraft file yet: Save asks
+/// where to put one (`<name>.fcproj`), so Premiere's own file is never overwritten.
+fn open_premiere(s: &mut Session, path: &str, bytes: &[u8]) -> Result<Value> {
+    let pr = crate::interchange::read_premiere(s, path, bytes)?;
+    let name = pr.project.name.clone();
+    install_project(s, pr.project, None, true);
+    if let Some(&first) = pr.sequences.first() {
+        s.state.active_sequence = Some(first);
+        s.state.open_sequences = vec![first];
+    }
+    if let Some(seq) = s.state.active_sequence {
+        s.events.push(crate::Event::OpenSequence(seq));
+    }
+    s.note_recent_file(path);
+    let warnings = crate::interchange::log_premiere_report(s, &name, &pr.report);
+    s.toast(if warnings == 0 {
+        format!("Opened the Premiere Pro project \"{name}\"")
+    } else {
+        format!("Opened the Premiere Pro project \"{name}\"; {warnings} kind(s) of content could not be brought over exactly (Window ▸ Events lists them)")
+    });
+    let missing = crate::relink::on_open(s);
+    Ok(json!({
+        "path": path,
+        "format": "Premiere Pro project",
+        "sequences": pr.sequences.iter().map(|i| i.0).collect::<Vec<_>>(),
+        "relinkedMedia": pr.relinked,
+        "missingMedia": missing,
+        "report": pr.report.entries.iter().map(|e| if e.count > 1 { format!("{} (×{})", e.message, e.count) } else { e.message.clone() }).collect::<Vec<_>>(),
+    }))
 }
 
 /// Load a recovery candidate (newest when `id` is None) as the current, unsaved project.

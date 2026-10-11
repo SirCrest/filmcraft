@@ -1,9 +1,10 @@
-//! Interchange documents (CMX 3600 EDL, FCP7 XML, FCPXML, OTIO, AAF, OMF) ↔ the session's project.
+//! Interchange documents (CMX 3600 EDL, FCP7 XML, FCPXML, OTIO, AAF, OMF) ↔ the session's project,
+//! and Premiere Pro projects (`.prproj`) → a project (File ▸ Open) or into one (File ▸ Import).
 
 use serde_json::{Value, json};
 
-use filmcraft_interchange::{ExportOptions, Format, ImportOptions};
-use filmcraft_project::{ItemId, ItemKind, MediaRef};
+use filmcraft_interchange::{ExportOptions, Format, ImportOptions, Imported, Level, Report};
+use filmcraft_project::{BinId, ItemId, ItemKind, MediaRef, Project};
 
 use crate::{EngineError, Result, Session};
 
@@ -119,6 +120,97 @@ pub fn import(s: &mut Session, path: &str, bytes: &[u8], format: Format) -> Resu
         "linkedMedia": linked,
         "offlineMedia": offline,
         "report": report_json(&report),
+    }))
+}
+
+/// Whether a file is a Premiere Pro project (by content: gzip-compressed or plain `<PremiereData>`).
+pub fn is_premiere(bytes: &[u8]) -> bool {
+    filmcraft_interchange::prproj::sniff(bytes)
+}
+
+/// Whether `path` names a Premiere Pro project file (`.prproj`), which FilmCraft never writes.
+pub fn is_premiere_path(path: &str) -> bool {
+    std::path::Path::new(path).extension().is_some_and(|e| e.eq_ignore_ascii_case("prproj"))
+}
+
+/// A Premiere Pro project read into a standalone FilmCraft project.
+pub(crate) struct PremiereProject {
+    pub project: Project,
+    /// Its top-level sequences, in project order.
+    pub sequences: Vec<ItemId>,
+    pub report: Report,
+    /// Media pointed at their project-relative path because the recorded one is missing.
+    pub relinked: usize,
+}
+
+/// Read a Premiere Pro project. Media whose recorded path is missing but whose project-relative
+/// path exists (the project moved together with its media, or was made on another computer) point
+/// there, as in Premiere.
+pub(crate) fn read_premiere(s: &Session, path: &str, bytes: &[u8]) -> Result<PremiereProject> {
+    let p = std::path::Path::new(path);
+    let opts = ImportOptions {
+        base_dir: p.parent().map(|d| d.to_string_lossy().to_string()),
+        name: p.file_stem().map(|n| n.to_string_lossy().to_string()),
+        ..Default::default()
+    };
+    let r = filmcraft_interchange::prproj::import(bytes, &opts).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+    let mut project = r.imported.project;
+    let mut relinked = 0;
+    for (id, alt) in r.relative_paths {
+        // the project-relative path first: it is local, while a recorded path on a disconnected
+        // drive or share can take long to fail
+        if let Some(m) = project.item_mut(id).and_then(|i| i.as_media_mut())
+            && let MediaRef::File { path: cur } = &mut m.media
+            && s.services.file_size(&alt).is_ok()
+            && s.services.file_size(cur).is_err()
+        {
+            *cur = alt;
+            relinked += 1;
+        }
+    }
+    // the frame-measured "auto" points, as placing a clip resolves them (anchors of file media
+    // stay auto: the renderer centres them in the size the file turns out to have)
+    project.resolve_placed_auto_points(|_| true, |source| !is_file_media(source));
+    Ok(PremiereProject { project, sequences: r.imported.sequences, report: r.report, relinked })
+}
+
+/// Put what a Premiere Pro project import could not bring over in the Events panel. Returns how
+/// many kinds of content were dropped or approximated.
+pub(crate) fn log_premiere_report(s: &mut Session, name: &str, report: &Report) -> usize {
+    let source = format!("Premiere Pro project \"{name}\"");
+    for e in &report.entries {
+        let level = if e.level == Level::Warning { crate::panels::Level::Warning } else { crate::panels::Level::Info };
+        let msg = if e.count > 1 { format!("{} (×{})", e.message, e.count) } else { e.message.clone() };
+        s.log.push(level, &source, msg);
+    }
+    report.warnings().count()
+}
+
+/// File ▸ Import of a Premiere Pro project: its bins, media and sequences go into a new bin named
+/// after it (one undo step), as Premiere imports a whole project.
+pub fn import_premiere(s: &mut Session, path: &str, bytes: &[u8], bin: Option<BinId>) -> Result<Value> {
+    let pr = read_premiere(s, path, bytes)?;
+    let name = pr.project.name.clone();
+    let fragment = Imported { project: pr.project, sequences: pr.sequences };
+    let seqs = s.edit(&format!("Import {name}"), |proj, _| {
+        let into = proj.add_bin(&name, bin);
+        Ok(filmcraft_interchange::merge_into(proj, fragment, Some(into)))
+    })?;
+    if let Some(&first) = seqs.first() {
+        s.state.active_sequence = Some(first);
+        if !s.state.open_sequences.contains(&first) {
+            s.state.open_sequences.push(first);
+        }
+    }
+    let warnings = log_premiere_report(s, &name, &pr.report);
+    if warnings > 0 {
+        s.toast(format!("Imported \"{name}\"; {warnings} kind(s) of content could not be brought over exactly (Window ▸ Events lists them)"));
+    }
+    Ok(json!({
+        "format": "Premiere Pro project",
+        "sequences": seqs.iter().map(|i| i.0).collect::<Vec<_>>(),
+        "relinkedMedia": pr.relinked,
+        "report": report_json(&pr.report),
     }))
 }
 

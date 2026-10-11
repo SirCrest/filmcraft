@@ -111,7 +111,7 @@ agent-hours to close the area to Premiere, sequential.
 | Colour | 8% | ~90% | ~70% | 40–70 | Lumetri complete incl. scopes, LUTs, colour management, HDR export. Lumetri on the GPU covers basic, creative and vignette only; HDR-aware Lumetri maths, macOS EDR display, D-Log M; a Lumetri report (#628) | |
 | Graphics, titles, captions | 8% | ~85% | ~65% | 50–90 | Text engine with shaping and bidi, shapes, gradients (#514), our `.fcgt` templates (`.mogrt` refused by design), rolls / crawls, all caption formats. Arabic titles reported broken (#395); no 608/708 embedding in the video stream; speech-to-text off in release builds | |
 | Export and delivery | 8% | ~80% | ~65% | 60–110 | H.264 (own encoder), HEVC through hardware only, ProRes, DNxHR, APV, MXF OP1a / OP-Atom, image sequences, GIF, WAV / AIFF, presets, queue, GPU export rendering (#421). Missing: AV1, MPEG-2 / DVD / Blu-ray, DCP, JPEG 2000 / XS MXF, AS-10 / AS-11, XDCAM HD, EXR / DPX / Targa sequences, MP3, AAC-only audio, ProRes 4444 in the UI (#342), interlaced, smart render; bitrate target missed (#371) | [file-format-parity.md](file-format-parity.md) |
-| Project files and interchange | 8% | ~70% | ~45% | 90–160 | `.fcproj` with migrations, auto-save, recovery; FCP7 XML, FCPXML, AAF, OMF, EDL, OTIO, ALE. **Premiere's own `.prproj` cannot be opened** (the main beta blocker); AAF / OMF never validated in Media Composer / Pro Tools; XML import of a Premiere sequence took 97 s (#461) | [file-format-parity.md](file-format-parity.md) |
+| Project files and interchange | 8% | ~70% | ~45% | 90–160 | `.fcproj` with migrations, auto-save, recovery; FCP7 XML, FCPXML, AAF, OMF, EDL, OTIO, ALE. **Premiere's own `.prproj` opens** (bins, media, sequences, clips, transitions, markers, common effects) but not yet with graphics text, masks or most effects, and cannot be written; AAF / OMF never validated in Media Composer / Pro Tools; XML import of a Premiere sequence took 97 s (#461) | [file-format-parity.md](file-format-parity.md) |
 | Preferences and project management | 4% | ~80% | ~65% | 20–40 | 16 Settings categories, most wired; Project Manager, proxies, Link Media; Media Manager limits (#411); images as proxies (#451) | |
 | **Features, weighted** | 100% | **~86%** | **~64%** | **740–1,290** | | |
 
@@ -224,13 +224,14 @@ Discounts for what still stops real work:
 - **Stability on real machines ×0.92:** current macOS on Apple silicon is solid, but launch
   crashes on macOS 12, Intel UHD and Windows 11 (#468, #512, #380, #582, #687), and no CI runs the
   tests on pull requests.
-- **File exchange with Premiere users ×0.88:** `.prproj` does not open (colleagues send
-  projects, not XML); AAF / OMF never validated in Avid / Pro Tools; FCP7 XML / OTIO do work.
+- **File exchange with Premiere users ×0.88:** `.prproj` opens, but titles, masks and most effects
+  stay behind (colleagues send projects, not XML); AAF / OMF never validated in Avid / Pro Tools;
+  FCP7 XML / OTIO do work.
 
 74.8 × 0.90 × 0.92 × 0.88 = **54.5% ≈ ~55%.** It is not higher than the full number, unlike most
 Craft apps: the parts the mainstream number leaves out (plugins, AI, localization) weigh only
 ~12% in the full number, while the three discounts hit exactly what a working editor meets every
-week. Raising it means fixing [G2](gaps.md#g2-premieres-prproj-cannot-be-opened),
+week. Raising it means fixing [G2](gaps.md#g2-premieres-prproj-opens-but-graphics-masks-and-most-effects-stay-behind),
 [G3](gaps.md#g3-10-bit-and-422-camera-media-needs-hardware),
 [G4](gaps.md#g4-crashes-at-start-up-and-no-test-ci-on-pull-requests) and
 [G8](gaps.md#g8-ui-fidelity-monitor-handles-effect-controls-docking).
@@ -293,13 +294,14 @@ niche requests among the bug reports about two to one, and nobody reports having
 
 **Alpha.** It passes the core-workflow gate ([roadmap.md](roadmap.md#alpha-gate): all six of Premiere's core daily workflows work end to end on macOS and the project saves and reopens). Core workflows run end to end (import, edit, trim, colour, mix, caption, deliver,
 round-trip through XML / AAF), but ready-for-real-work is ~56%, below the ~75% beta bar, and the
-standard's beta condition "opens and saves the target's main format reliably" fails outright:
-FilmCraft cannot open a `.prproj` (it reads Premiere's FCP7 XML / AAF / OTIO exports instead).
-Distance to beta: ~19 points of ready-for-real-work plus `.prproj` import, ~400–700 agent-hours:
+standard's beta condition "opens and saves the target's main format reliably" is not met yet:
+FilmCraft opens a `.prproj` (its edits, media, markers and common effects) but leaves graphics
+text, masks and most effects behind, and saves a `.fcproj`, not a `.prproj`.
+Distance to beta: ~19 points of ready-for-real-work plus finishing `.prproj` import, ~400–700 agent-hours:
 
 | To reach beta | Hours |
 |---|---|
-| `.prproj` import of mainstream projects (sequences, clips, effects' common parameters, markers) | 60–120 |
+| `.prproj` import of mainstream projects: graphics text and shapes, masks, more effects (sequences, clips, common effect parameters and markers are done) | 40–80 |
 | Stability: launch crashes, PR CI running `cargo xtask ci` on all three OSs, crash triage | 40–80 |
 | H.264 High 10 / 4:2:2 and HEVC 4:2:2 software decoding (camera media) | 30–50 |
 | Real-world media corpus and scripted workflow acceptance tests | 40–70 |

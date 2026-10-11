@@ -1121,7 +1121,7 @@ impl FilmcraftApp {
                     .iter()
                     .chain(filmcraft_media::AUDIO_EXTENSIONS)
                     .chain(filmcraft_media::STILL_EXTENSIONS)
-                    .chain(&["srt", "vtt", "scc", "edl", "xml", "fcpxml", "otio", "aaf", "omf"])
+                    .chain(&["srt", "vtt", "scc", "edl", "xml", "fcpxml", "otio", "aaf", "omf", "prproj"])
                     .copied()
                     .collect();
                 let paths = self.hooks.pick_files.as_mut().map(|f| f(&exts)).unwrap_or_default();
@@ -1236,6 +1236,26 @@ impl FilmcraftApp {
             if p.exists() {
                 paths.push(p.to_string_lossy().to_string());
             }
+        }
+        // A project file dropped on its own opens it (a FilmCraft or Premiere Pro project), as File
+        // ▸ Open does, unless that would discard unsaved changes: then a Premiere project is
+        // imported into this one (as Premiere imports a project dropped on its Project panel).
+        if let [one] = paths.as_slice()
+            && let Some(kind) = project_file_kind(one)
+        {
+            let path = one.clone();
+            let r = if !self.session.is_dirty() {
+                self.session.execute("file.open", json!({"path": path}))
+            } else if kind == "prproj" {
+                self.session.execute("file.import", json!({"paths": [path], "bin": self.import_bin().0}))
+            } else {
+                self.ui.status = tl!("Save or revert the current project before opening another one").into();
+                return;
+            };
+            if let Err(e) = r {
+                self.ui.status = e.to_string();
+            }
+            return;
         }
         if !paths.is_empty() {
             let pointer = self.drop_pointer(ctx);
@@ -2054,6 +2074,16 @@ mod audio_recovery_tests {
 fn screen_px_to_ui(px: (i32, i32), pixels_per_point: f32, content_min: egui::Pos2) -> egui::Pos2 {
     let ppp = if pixels_per_point.is_finite() && pixels_per_point > 0.0 { pixels_per_point } else { 1.0 };
     egui::pos2(px.0 as f32 / ppp - content_min.x, px.1 as f32 / ppp - content_min.y)
+}
+
+/// `"fcproj"` or `"prproj"` for a project file File ▸ Open reads (FilmCraft, Premiere Pro).
+pub fn project_file_kind(path: &str) -> Option<&'static str> {
+    let ext = std::path::Path::new(path).extension()?.to_str()?.to_ascii_lowercase();
+    match ext.as_str() {
+        "fcproj" => Some("fcproj"),
+        "prproj" => Some("prproj"),
+        _ => None,
+    }
 }
 
 #[cfg(test)]

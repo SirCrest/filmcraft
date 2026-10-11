@@ -10,7 +10,7 @@
 //! const {pngBase64} = await filmcraft.screenshot()         // the canvas as PNG (base64)
 //! await filmcraft.importUrl("/clip.mp4")                   // fetch + import (tests)
 //! await filmcraft.importFiles(input.files)                 // File / FileList / File[]
-//! await filmcraft.openProject(file)                        // .fcproj File or URL
+//! await filmcraft.openProject(file)                        // .fcproj / .prproj File or URL
 //! filmcraft.files(); await filmcraft.readFile("/exports/a.mp4"); filmcraft.info()
 //! ```
 //!

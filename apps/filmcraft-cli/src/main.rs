@@ -97,9 +97,11 @@ SUBCOMMANDS
   --version                     print the version
 
 OPTIONS
-  --project <p.fcproj>          open this project first (headless)
+  --project <p.fcproj|p.prproj> open this project first (headless); a Premiere Pro project
+                                opens like a FilmCraft one
   --demo                        open the built-in demo project (headless)
-  --save                        save the project back to --project when done
+  --save                        save the project back to --project when done (a Premiere Pro
+                                project is never overwritten: <p>.fcproj is written beside it)
   --save-as <p.fcproj>          save the project to this path when done
   --bridge <127.0.0.1:PORT>     send commands to the running app (`filmcraft --control PORT`)
   --data-dir <dir>              FilmCraft data directory for user export presets (headless;
@@ -179,6 +181,12 @@ impl Backend {
             Some(self.exec("file.saveAs", json!({"path": p})).await)
         } else if a.flag("--save") {
             match a.opt("--project") {
+                // never written over: the FilmCraft project goes beside it
+                Some(p) if filmcraft_engine::interchange::is_premiere_path(p) => {
+                    let to = std::path::Path::new(p).with_extension("fcproj").to_string_lossy().to_string();
+                    diag(format_args!("filmcraft-cli: {p} is a Premiere Pro project; saving the FilmCraft project as {to}"));
+                    Some(self.exec("file.saveAs", json!({"path": to})).await)
+                }
                 Some(p) => Some(self.exec("file.save", json!({"path": p})).await),
                 None => Some(self.exec("file.save", json!({})).await),
             }

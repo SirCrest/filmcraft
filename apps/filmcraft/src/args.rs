@@ -2,7 +2,9 @@
 
 /// `filmcraft --help`.
 pub const USAGE: &str = "\
-Usage: filmcraft [options] [project.fcproj | media files...]
+Usage: filmcraft [options] [project.fcproj | project.prproj | media files...]
+
+A Premiere Pro project (.prproj) opens like a FilmCraft one; saving it writes a .fcproj.
 
 Options:
   --control <port>   start the localhost JSON-lines control server

@@ -1,8 +1,9 @@
 # filmcraft-interchange
 
 Timeline interchange for FilmCraft: CMX 3600 EDL, Final Cut Pro 7 XML (xmeml), FCPXML,
-OpenTimelineIO, AAF and OMF import and export, plus Avid ALE. Layer L2: no file I/O; media
-references are strings and audio essence is supplied by the caller (the engine).
+OpenTimelineIO, AAF and OMF import and export, plus Avid ALE, and import of Adobe Premiere Pro
+projects (`.prproj`). Layer L2: no file I/O; media references are strings and audio essence is
+supplied by the caller (the engine).
 
 ## Specifications
 
@@ -23,6 +24,35 @@ read off files it exports, never from the application itself.
 | WAVE / AIFF | Microsoft RIFF WAVE; Apple AIFF 1.3 | — | embedded and separate audio files |
 
 The other formats' editions are listed in the module docs (`edl`, `fcp7`, `fcpxml`, `otio`, `ale`).
+
+Premiere Pro projects have no public specification. `prproj` was written from what projects saved
+by recent Premiere Pro releases (project versions 43 and 45) contain, read as data: gzip (RFC 1952) around
+raw DEFLATE (RFC 1951, inflated by the `miniz_oxide` crate), and XML. Nothing inside the
+application was read.
+
+## Premiere Pro projects
+
+`prproj::import` turns a project into a standalone FilmCraft project (an `Imported` fragment);
+the engine opens it as the session's project (File ▸ Open, recent files, `--project`, a dropped
+file) or merges it into a bin (File ▸ Import). FilmCraft never writes a `.prproj`: saving an opened
+Premiere project asks for a `.fcproj`.
+
+| Premiere | FilmCraft |
+|---|---|
+| bins, project items (labels; the master clip's current name) | bins, items |
+| media: path (absolute, plus the project-relative path the engine tries when that is missing), stream size / rate / duration / audio layout, source In / Out, source markers | file media |
+| Color Matte, Black Video, Transparent Video; adjustment layers | generators; adjustment layers (all rebased to media time zero, as are stills) |
+| sequences: frame size and rate, drop-frame display, sample rate, In / Out, markers | sequences |
+| tracks: name, lock, sync lock, output (video); audio mute, fader volume and pan | tracks |
+| clips: position, In point, speed, reverse, enable, label, clip gain, frame hold, Scale to Frame Size, links, groups, nests, Remix clips (their remixed edit, as a nest) | track items |
+| transitions: position, alignment (start / centre / end at cut), one- and two-sided, by name | transitions (unknown names: Cross Dissolve / Constant Power, reported) |
+| Motion (position, scale, scale width, uniform, rotation, anchor, anti-flicker, crop), Opacity (opacity, blend mode), Volume, Channel Volume, Lumetri Color (Basic Correction and Creative sliders), Crop, Drop Shadow, Ultra Key, Luma Key, Posterize Time, all with keyframes (linear, hold, Bézier kinds, influence) | effects |
+
+Reported and not imported: Essential Graphics text and shapes (the clip comes in as an empty
+graphic), masks, other video effects (third-party plug-ins included), audio plug-ins and audio
+effects other than Volume / Channel Volume (on clips and as track inserts), track volume
+automation, caption and transcript tracks. Time remapping speed ramps become their average constant speed. Projects are bounded: at
+most 512 MB of XML, bins 64 deep, nests that contain themselves are cut.
 
 ## AAF and OMF
 
@@ -100,3 +130,12 @@ OMF carries no video at all.
   nested compositions tagged top-level) reads back as the same edit.
 - `src/omf/tests.rs`: the Bento label and TOC, the required properties of every OMF class
   written, reference resolution, embedded WAVE data, sequence lengths in samples.
+- `tests/prproj.rs`: a synthetic project written in the test (Premiere's object layout) imports
+  with its bins, labels, media, generators, adjustment layer, sequence settings, tracks, clips
+  (speed, reverse, disabled, frame hold, gain, links), transitions, markers and effect keyframes;
+  gzip and plain XML import alike; damaged files (truncated, corrupted, hostile numbers),
+  self-nesting sequences and 200 nested bins never panic. `src/prproj.rs`: gzip framing and
+  CRC-32, value decoders, keyframe parsing.
+- `tests/prproj_corpus.rs` (opt-in): `FILMCRAFT_PRPROJ_CORPUS=<dir>` imports every `.prproj` under
+  a directory of real projects (auto-saves skipped) and checks the result's invariants; real
+  projects are never committed.
