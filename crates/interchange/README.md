@@ -79,6 +79,15 @@ none of the exports brings one back. Each such clip is named in the export `Repo
 
 OMF carries no video at all.
 
+## Damaged and hostile XML
+
+FCP7 XML and FCPXML documents whose elements nest deeper than `MAX_XML_DEPTH` (128) are refused
+before parsing. Real documents nest 11–16 deep (FCP7 adds about five levels per nested sequence
+written inline and two per bin); the XML parser and the importers recurse per level, so a damaged
+or hostile file would otherwise overflow the stack. The pre-scan (`xml::nesting_depth`) reads the
+document the way the parser does, DOCTYPE literals and internal-subset entities included (an
+entity's elements count once per expansion the parser can nest).
+
 ## Tests
 
 - `tests/aaf_omf.rs`: AAF round trips at 25, 29.97 DF, 23.976 and 59.94 DF (clips, gaps,
@@ -89,6 +98,10 @@ OMF carries no video at all.
   random corruption never panic. Nested sequences: AAF round trips as compositions (nests in
   nests, a nest used twice, another frame and sample rate, breakout to mono), OMF with the
   rendered sound, the audio needs of nests, a sequence inside itself.
+- `tests/fcp7.rs`, `tests/fcpxml.rs`: documents nested 100 000 deep (plainly, unclosed, behind a
+  DOCTYPE literal, through nested entity expansions) are refused, not parsed; documents at
+  `MAX_XML_DEPTH`, including bins in bins and connected clips or storylines in clips, import on a
+  512 KB stack.
 - `tests/uncarried_clips.rs`: every format's export report names each graphic clip and adjustment
   layer once, as a warning; a sequence without them reports nothing; what a re-import gives back
   matches the report; the FCP7 XML import names a clip item whose file is not defined.

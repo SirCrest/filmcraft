@@ -55,7 +55,9 @@ implementation's code was consulted.
 ## Tests
 
 - Unit tests per module (timestamps, decoding, sloppy SRT, WebVTT blocks and voices, CEA-608
-  tables, PAC round trips, known SCC pop-on and roll-up streams, layout).
+  tables, PAC round trips, known SCC pop-on and roll-up streams, layout). TTML nested deeper than
+  128 elements is refused before parsing (the XML parser recurses per level); at the limit it reads
+  on a 512 KB stack.
 - `tests/roundtrip.rs`: property tests — SRT (also with BOM + CRLF), WebVTT (ids, speakers,
   settings, STYLE blocks), SCC and MCC (drop-frame and non-drop, gaps and back-to-back captions;
   MCC also through CEA-708 alone), EBU STL (25 and 29.97 fps, accents, extension blocks), TTML

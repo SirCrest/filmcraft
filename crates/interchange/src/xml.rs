@@ -143,7 +143,135 @@ pub(crate) fn num(v: f64) -> String {
     format!("{v}")
 }
 
+/// Deepest element nesting [`parse`] accepts. Real FCP7 XML and FCPXML documents nest 11–16 deep
+/// (FCP7 adds about five levels per nested sequence written inline and two per bin). The XML parser
+/// and the importers recurse per level, up to 2 KB of stack each in debug builds (FCPXML connected
+/// clips), so a deeper document is refused before it can exhaust the stack.
+pub const MAX_XML_DEPTH: usize = 128;
+
+/// Entity expansions the XML parser nests inside one another (roxmltree's documented limit).
+const ENTITY_NESTING: usize = 10;
+
+/// An upper bound on the element nesting the XML parser reaches in `xml`; counting stops once it
+/// passes `limit`. Exact for the well-formed prefix of a document, which is all the parser gets
+/// through: quotes, comments, CDATA, processing instructions and the DOCTYPE are skipped like the
+/// parser does. Elements inside internal-subset entities count once per expansion the parser nests.
+pub(crate) fn nesting_depth(xml: &[u8], limit: usize) -> usize {
+    let mut entities = 0;
+    let depth = content_depth(xml, limit, Some(&mut entities));
+    depth.saturating_add(entities.saturating_mul(ENTITY_NESTING))
+}
+
+/// Index just past the first `pat` at or after `from`.
+fn find(xml: &[u8], from: usize, pat: &[u8]) -> Option<usize> {
+    xml.get(from..)?.windows(pat.len()).position(|w| w == pat).map(|p| from + p + pat.len())
+}
+
+/// Index just past the first of `stops` at or after `from` outside a quoted literal, and that byte.
+/// `literal` sees each literal's contents.
+fn skip_quoted(xml: &[u8], from: usize, stops: &[u8], mut literal: impl FnMut(&[u8])) -> Option<(usize, u8)> {
+    let mut i = from;
+    loop {
+        let c = *xml.get(i)?;
+        if c == b'"' || c == b'\'' {
+            let end = i + 1 + xml.get(i + 1..)?.iter().position(|&q| q == c)?;
+            literal(xml.get(i + 1..end)?);
+            i = end;
+        } else if stops.contains(&c) {
+            return Some((i + 1, c));
+        }
+        i += 1;
+    }
+}
+
+/// The deepest element nesting in `xml` read as element content, counting stops once it passes
+/// `limit`. With `entities`, a DOCTYPE is read like the parser does and the deepest nesting in its
+/// entity values is recorded there.
+fn content_depth(xml: &[u8], limit: usize, mut entities: Option<&mut usize>) -> usize {
+    let (mut depth, mut max, mut i) = (0usize, 0usize, 0usize);
+    while let Some(at) = xml.get(i..).and_then(|s| s.iter().position(|&c| c == b'<')).map(|p| i + p) {
+        let rest = xml.get(at..).unwrap_or_default();
+        i = match rest.get(1) {
+            None => break,
+            Some(b'/') => {
+                depth = depth.saturating_sub(1);
+                at + 2
+            }
+            Some(b'?') => find(xml, at + 2, b"?>").unwrap_or(xml.len()),
+            Some(b'!') if rest.starts_with(b"<!--") => find(xml, at + 4, b"-->").unwrap_or(xml.len()),
+            Some(b'!') if rest.starts_with(b"<![CDATA[") => find(xml, at + 9, b"]]>").unwrap_or(xml.len()),
+            Some(b'!') => match entities.as_deref_mut() {
+                Some(e) if rest.starts_with(b"<!DOCTYPE") => match doctype(xml, at + 9, limit, e) {
+                    Some(end) => end,
+                    None => break,
+                },
+                _ => find(xml, at + 2, b">").unwrap_or(xml.len()),
+            },
+            Some(_) => {
+                // a start tag, to its '>' outside quoted attribute values
+                let (mut j, mut quote, mut self_closing) = (at + 1, None, false);
+                while let Some(&c) = xml.get(j) {
+                    match quote {
+                        Some(q) if c == q => quote = None,
+                        Some(_) => {}
+                        None if c == b'"' || c == b'\'' => quote = Some(c),
+                        None if c == b'>' => {
+                            self_closing = xml.get(j - 1) == Some(&b'/');
+                            break;
+                        }
+                        None => {}
+                    }
+                    j += 1;
+                }
+                max = max.max(depth + 1);
+                if max > limit {
+                    return max;
+                }
+                if !self_closing {
+                    depth += 1;
+                }
+                j + 1
+            }
+        };
+    }
+    max
+}
+
+/// Skips a DOCTYPE from just after `<!DOCTYPE` as the parser reads it (its external ID's literals
+/// may hold `>` or `<!--`), recording in `entities` the deepest nesting in an entity value of its
+/// internal subset. Returns where the document continues, or `None` where the parser fails.
+fn doctype(xml: &[u8], from: usize, limit: usize, entities: &mut usize) -> Option<usize> {
+    let (mut i, end) = skip_quoted(xml, from, b"[>", |_| {})?;
+    if end == b'>' {
+        return Some(i);
+    }
+    let space = |i: usize| xml.get(i..).map_or(0, |s| s.iter().take_while(|c| matches!(c, b' ' | b'\t' | b'\n' | b'\r')).count());
+    loop {
+        i += space(i);
+        let rest = xml.get(i..)?;
+        i = if rest.starts_with(b"<!ENTITY") {
+            skip_quoted(xml, i + 8, b">", |value| *entities = (*entities).max(content_depth(value, limit, None)))?.0
+        } else if rest.starts_with(b"<!--") {
+            find(xml, i + 4, b"-->")?
+        } else if rest.starts_with(b"<?") {
+            find(xml, i + 2, b"?>")?
+        } else if rest.starts_with(b"<!ELEMENT") || rest.starts_with(b"<!ATTLIST") || rest.starts_with(b"<!NOTATION") {
+            // the parser skips these to their first '>', quoted or not
+            find(xml, i + 2, b">")?
+        } else if rest.starts_with(b"]") {
+            let j = i + 1 + space(i + 1);
+            return (xml.get(j) == Some(&b'>')).then_some(j + 1);
+        } else {
+            return None;
+        };
+    }
+}
+
+/// Parses `text`, refusing documents nested deeper than [`MAX_XML_DEPTH`].
 pub(crate) fn parse(text: &str) -> Result<roxmltree::Document<'_>, String> {
+    if nesting_depth(text.as_bytes(), MAX_XML_DEPTH) > MAX_XML_DEPTH {
+        return Err(format!("elements are nested more than {MAX_XML_DEPTH} deep (the file is damaged)"));
+    }
     let opts = roxmltree::ParsingOptions { allow_dtd: true, ..Default::default() };
     roxmltree::Document::parse_with_options(text, opts).map_err(|e| e.to_string())
 }
@@ -168,5 +296,42 @@ mod tests {
         assert_eq!(num(100.0), "100");
         assert_eq!(num(-0.0), "0");
         assert_eq!(num(0.1 + 0.2).parse::<f64>().unwrap(), 0.1 + 0.2);
+    }
+
+    #[test]
+    fn nesting() {
+        let d = |s: &str| nesting_depth(s.as_bytes(), 1000);
+        // the element nesting the parser reaches, for documents it accepts
+        let parsed = |s: &str| {
+            let doc = parse(s).unwrap();
+            doc.descendants().map(|n| n.ancestors().filter(|a| a.is_element()).count()).max().unwrap_or(0)
+        };
+        for s in [
+            "<a><b/><c x=\"1\"><d></d></c></a>",
+            "<?xml version=\"1.0\"?><!-- <x><x><x> --><a><![CDATA[<b><c>]]></a>",
+            // '>' and "/>" inside attribute values do not end the tag
+            "<a t=\"x/>\"><b t='>'><c/></b></a>",
+            // a DOCTYPE's literals may hold '>' and comment openers
+            "<!DOCTYPE x SYSTEM \"><!--\"><x><y/></x>",
+            "<!DOCTYPE x PUBLIC '[' \"]>\" [<!ELEMENT x (#PCDATA)><!-- ]> --><?pi ]>?>]  ><x><y></y></x>",
+            "<!DOCTYPE x [<!ENTITY e 'text'>]><x>&e;</x>",
+        ] {
+            assert_eq!(d(s), parsed(s), "{s}");
+        }
+        assert_eq!(d(&format!("{}{}", "<a>".repeat(50), "</a>".repeat(50))), 50);
+        assert_eq!(nesting_depth("<a>".repeat(10_000).as_bytes(), 128), 129, "stops counting past the limit");
+        // unterminated constructs end the scan (an unfinished tag counts: over, never under)
+        assert_eq!(d("<a><!-- open"), 1);
+        assert_eq!(d("<a b=\"unclosed><c><d>"), 1);
+        // elements in entity values count once per expansion the parser can nest
+        let s = "<!DOCTYPE x [<!ENTITY e '<a><b/></a>'>]><x>&e;</x>";
+        assert_eq!((parsed(s), d(s)), (3, 1 + ENTITY_NESTING * 2));
+        // ELEMENT, ATTLIST and NOTATION end at their first '>': a quote there hides no entity
+        assert_eq!(d("<!DOCTYPE x [<!ELEMENT x '> <!ENTITY e \"<a><b>\"> <!ATTLIST x '>]><x/>"), 1 + ENTITY_NESTING * 2);
+        // the parser stops at an unknown DTD token, and so does the scan
+        assert_eq!(d("<!DOCTYPE x [<!BOGUS> ]><x><y><z/></y></x>"), 0);
+        assert!(parse("<!DOCTYPE x [<!BOGUS> ]><x><y><z/></y></x>").is_err());
+        let e = parse(&"<a>".repeat(MAX_XML_DEPTH + 1)).unwrap_err();
+        assert!(e.contains("nested"), "{e}");
     }
 }

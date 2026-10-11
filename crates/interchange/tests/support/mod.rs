@@ -245,3 +245,33 @@ pub fn only_seq(imp: &Imported) -> ItemId {
 pub fn f(rate: FrameRate, n: i64) -> Tick {
     rate.tick_of(n)
 }
+
+/// `n` nested `<tag>` elements.
+pub fn nest(tag: &str, n: usize) -> String {
+    format!("{}{}", format!("<{tag}>").repeat(n), format!("</{tag}>").repeat(n))
+}
+
+/// Documents rooted at `<root>` that nest far deeper than any real one: plainly; unclosed, with `>` and
+/// `/>` inside attribute values; behind a DOCTYPE whose quoted literal holds a comment opener; and
+/// through internal-subset entities that each nest under the limit but expand inside one another.
+pub fn deeply_nested(root: &str) -> Vec<String> {
+    let deep = nest("a", 100_000);
+    let entities: String = (0..10)
+        .map(|i| {
+            let inner = if i == 0 { String::new() } else { format!("&e{};", i - 1) };
+            format!("<!ENTITY e{i} \"{}{inner}{}\">\n", "<a>".repeat(200), "</a>".repeat(200))
+        })
+        .collect();
+    vec![
+        format!("<?xml version=\"1.0\"?>\n<!DOCTYPE {root}>\n<{root}>{deep}</{root}>"),
+        format!("<{root}>{}", "<a t=\"/>\">".repeat(100_000)),
+        format!("<!DOCTYPE {root} SYSTEM \"><!--\">\n<{root}>{deep}</{root}>"),
+        format!("<!DOCTYPE {root} [\n{entities}]>\n<{root}>&e9;</{root}>"),
+    ]
+}
+
+/// Runs `f` on a thread with a 512 KB stack: half of what the app imports on (its UI thread, 1 MB on
+/// Windows).
+pub fn on_small_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    std::thread::Builder::new().stack_size(512 << 10).spawn(f).unwrap().join().unwrap()
+}

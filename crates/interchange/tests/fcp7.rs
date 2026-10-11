@@ -3,7 +3,7 @@
 
 mod support;
 
-use filmcraft_interchange::{ExportOptions, Format, detect, export, import};
+use filmcraft_interchange::{ExportOptions, Format, MAX_XML_DEPTH, detect, export, import};
 use filmcraft_media::Generator;
 use filmcraft_project::{ItemKind, Keyframe, Label, Marker, MarkerId, MarkerKind, MediaRef, Param, ParamValue, Project, TrackKind, TransitionAlign};
 use filmcraft_time::{FrameRate, Tick};
@@ -599,4 +599,33 @@ fn audio_trackindex_1_is_channel_0_only_when_the_file_is_split() {
     assert_eq!(a1[0].source_channels, vec![0u16]);
     assert!(a1[1].source_channels.is_empty(), "{:?}", a1[1].source_channels);
     assert_eq!(seq.tracks(TrackKind::Audio)[1].items[0].source_channels, vec![1u16]);
+}
+
+/// Damaged or hostile documents nested far deeper than any real one are refused before parsing: the
+/// XML parser recurses per element level and would overflow the stack.
+#[test]
+fn deeply_nested_xml_does_not_overflow_the_stack() {
+    let mut docs = deeply_nested("xmeml");
+    docs.push(premiere_style_doc().replace("<name>Lighthouse</name>", &format!("<name>Lighthouse</name>{}", nest("a", 100_000))));
+    for xml in docs {
+        let e = on_small_stack(move || import(xml.as_bytes(), Format::Fcp7Xml, None).err().map(|e| e.to_string())).unwrap_or_default();
+        assert!(e.contains("nested"), "{e}");
+    }
+    // at the limit imports, even on a small stack (one level more does not)
+    let at = |n: usize| premiere_style_doc().replace("<name>Lighthouse</name>", &format!("<name>Lighthouse</name>{}", nest("a", n)));
+    let (ok, over) = (at(MAX_XML_DEPTH - 2), at(MAX_XML_DEPTH - 1));
+    assert!(on_small_stack(move || import(ok.as_bytes(), Format::Fcp7Xml, None).is_ok()));
+    assert!(import(over.as_bytes(), Format::Fcp7Xml, None).is_err());
+    // bins in bins to the limit: the importer recurses per bin too
+    let bins = (MAX_XML_DEPTH - 7) / 2;
+    let doc = format!(
+        r#"<xmeml version="4"><project><name>P</name><children>{}<clip id="masterclip-1"><name>take</name><duration>48</duration>{RATE}<file id="file-1"><name>take.mov</name><pathurl>file://localhost/media/take.mov</pathurl>{RATE}<duration>48</duration><media><video/></media></file></clip>{}</children></project></xmeml>"#,
+        "<bin><name>B</name><children>".repeat(bins),
+        "</children></bin>".repeat(bins)
+    );
+    let (imp, _) = on_small_stack(move || import(doc.as_bytes(), Format::Fcp7Xml, None)).unwrap();
+    fn bin_depth(b: &filmcraft_project::Bin) -> usize {
+        b.children.iter().map(|c| if let filmcraft_project::BinEntry::Bin(sub) = c { 1 + bin_depth(sub) } else { 0 }).max().unwrap_or(0)
+    }
+    assert_eq!(bin_depth(&imp.project.root), bins);
 }

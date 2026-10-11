@@ -394,7 +394,64 @@ fn clean(s: &str) -> String {
     s.lines().map(str::trim).collect::<Vec<_>>().join("\n").trim().to_string()
 }
 
+/// Deepest element nesting read. Real TTML nests under ten deep (`tt`, `body`, `div`, `p`, `span`);
+/// the XML parser and the readers here recurse per level, so a deeper document is refused before it
+/// can exhaust the stack.
+const MAX_XML_DEPTH: usize = 128;
+
+/// Byte offset of the first element nested deeper than `limit`, scanning `xml` as the XML parser
+/// reads it: quotes, comments, CDATA and processing instructions are skipped like it does, and it
+/// refuses a DOCTYPE before reading any element. Keep in step with `filmcraft-interchange`'s
+/// `xml::nesting_depth`, which also reads DTDs.
+fn too_deep(xml: &[u8], limit: usize) -> Option<usize> {
+    let find = |from: usize, pat: &[u8]| xml.get(from..).and_then(|s| s.windows(pat.len()).position(|w| w == pat)).map(|p| from + p + pat.len());
+    let (mut depth, mut i) = (0usize, 0usize);
+    while let Some(at) = xml.get(i..).and_then(|s| s.iter().position(|&c| c == b'<')).map(|p| i + p) {
+        let rest = xml.get(at..).unwrap_or_default();
+        i = match rest.get(1) {
+            None => break,
+            Some(b'/') => {
+                depth = depth.saturating_sub(1);
+                at + 2
+            }
+            Some(b'?') => find(at + 2, b"?>")?,
+            Some(b'!') if rest.starts_with(b"<!--") => find(at + 4, b"-->")?,
+            Some(b'!') if rest.starts_with(b"<![CDATA[") => find(at + 9, b"]]>")?,
+            Some(b'!') => find(at + 2, b">")?,
+            Some(_) => {
+                if depth >= limit {
+                    return Some(at);
+                }
+                // a start tag, to its '>' outside quoted attribute values
+                let (mut j, mut quote, mut self_closing) = (at + 1, None, false);
+                while let Some(&c) = xml.get(j) {
+                    match quote {
+                        Some(q) if c == q => quote = None,
+                        Some(_) => {}
+                        None if c == b'"' || c == b'\'' => quote = Some(c),
+                        None if c == b'>' => {
+                            self_closing = xml.get(j - 1) == Some(&b'/');
+                            break;
+                        }
+                        None => {}
+                    }
+                    j += 1;
+                }
+                if !self_closing {
+                    depth += 1;
+                }
+                j + 1
+            }
+        };
+    }
+    None
+}
+
 pub fn parse(text: &str) -> Result<Document> {
+    if let Some(at) = too_deep(text.as_bytes(), MAX_XML_DEPTH) {
+        let line = text.as_bytes().get(..at).map_or(0, |s| s.iter().filter(|&&c| c == b'\n').count()) + 1;
+        return Err(Error::Syntax { line, msg: format!("elements are nested more than {MAX_XML_DEPTH} deep (the file is damaged)") });
+    }
     let xml = roxmltree::Document::parse(text).map_err(|_| Error::NotFormat("TTML"))?;
     let root = xml.root_element();
     if root.tag_name().name() != "tt" {
@@ -598,5 +655,54 @@ mod tests {
         assert_eq!(back.cues[0].speaker.as_deref(), Some("Ann Lee"));
         let d = write(&doc, Flavor::Dfxp, Some(r), "en");
         assert!(d.contains(DFXP_PROFILE) && d.contains("begin=\"00:00:01.001\""), "{d}");
+    }
+
+    /// Runs `f` on a thread with a 512 KB stack: half of what the app imports on (its UI thread, 1 MB
+    /// on Windows).
+    fn on_small_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        std::thread::Builder::new().stack_size(512 << 10).spawn(f).unwrap().join().unwrap()
+    }
+
+    /// Damaged or hostile documents nested far deeper than any real one are refused before parsing:
+    /// the XML parser recurses per element level and would overflow the stack.
+    #[test]
+    fn deeply_nested_xml_does_not_overflow_the_stack() {
+        let tt = |inner: &str| format!("<tt xmlns=\"http://www.w3.org/ns/ttml\">\n<body><div><p begin=\"1s\" end=\"2s\">{inner}</p></div></body></tt>");
+        let spans = |n: usize| format!("{}x{}", "<span>".repeat(n), "</span>".repeat(n));
+        for xml in [tt(&spans(100_000)), tt(&"<span t=\"/>\">".repeat(100_000))] {
+            match on_small_stack(move || parse(&xml)) {
+                Err(Error::Syntax { line, msg }) => assert!(line == 2 && msg.contains("nested"), "{line}: {msg}"),
+                r => panic!("{r:?}"),
+            }
+        }
+        // at the limit reads, even on a small stack (one level more does not): spans in spans, and
+        // divs in divs
+        let (ok, over) = (tt(&spans(MAX_XML_DEPTH - 4)), tt(&spans(MAX_XML_DEPTH - 3)));
+        assert_eq!(on_small_stack(move || parse(&ok)).unwrap().cues[0].text, "x");
+        assert!(parse(&over).is_err());
+        let n = MAX_XML_DEPTH - 3;
+        let ok =
+            format!("<tt xmlns=\"http://www.w3.org/ns/ttml\"><body>{}<p begin=\"1s\" end=\"2s\">x</p>{}</body></tt>", "<div>".repeat(n), "</div>".repeat(n));
+        assert_eq!(on_small_stack(move || parse(&ok)).unwrap().cues.len(), 1);
+    }
+
+    #[test]
+    fn nesting_scan_matches_the_parser() {
+        let parsed =
+            |s: &str| roxmltree::Document::parse(s).unwrap().descendants().map(|n| n.ancestors().filter(|a| a.is_element()).count()).max().unwrap_or(0);
+        for s in [
+            "<a><b/><c x=\"1\"><d></d></c></a>",
+            "<?xml version=\"1.0\"?><!-- <x><x><x> --><a><![CDATA[<b><c>]]></a>",
+            // '>' and "/>" inside attribute values do not end the tag
+            "<a t=\"x/>\"><b t='>'><c/></b></a>",
+        ] {
+            let depth = parsed(s);
+            assert_eq!(too_deep(s.as_bytes(), depth), None, "{s}");
+            assert!(too_deep(s.as_bytes(), depth - 1).is_some(), "{s}");
+        }
+        assert_eq!(too_deep(b"<a>\n<b>", 1), Some(4));
+        // unterminated constructs end the scan
+        assert_eq!(too_deep(b"<a><!-- <b><c>", 1), None);
+        assert_eq!(too_deep(b"<a b=\"unclosed><c><d>", 1), None);
     }
 }
