@@ -86,7 +86,9 @@ before parsing. Real documents nest 11–16 deep (FCP7 adds about five levels pe
 written inline and two per bin); the XML parser and the importers recurse per level, so a damaged
 or hostile file would otherwise overflow the stack. The pre-scan (`xml::nesting_depth`) reads the
 document the way the parser does, DOCTYPE literals and internal-subset entities included (an
-entity's elements count once per expansion the parser can nest).
+entity's elements count once per expansion the parser can nest). After parsing, the tree's depth
+is measured again without recursion, so the importers never walk a deeper tree however the
+parser built it.
 
 ## Tests
 

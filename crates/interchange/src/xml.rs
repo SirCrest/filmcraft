@@ -267,13 +267,36 @@ fn doctype(xml: &[u8], from: usize, limit: usize, entities: &mut usize) -> Optio
     }
 }
 
+/// The deepest element nesting in a parsed document, without recursion.
+fn tree_depth(doc: &roxmltree::Document<'_>) -> usize {
+    // elements come in document order, so a node's ancestors are on `path` when it is reached
+    let mut path: Vec<roxmltree::NodeId> = Vec::new();
+    let mut max = 0;
+    for n in doc.descendants().filter(|n| n.is_element()) {
+        let parent = n.parent().map(|p| p.id());
+        while path.last().is_some_and(|&top| Some(top) != parent) {
+            path.pop();
+        }
+        path.push(n.id());
+        max = max.max(path.len());
+    }
+    max
+}
+
 /// Parses `text`, refusing documents nested deeper than [`MAX_XML_DEPTH`].
 pub(crate) fn parse(text: &str) -> Result<roxmltree::Document<'_>, String> {
+    let too_deep = || format!("elements are nested more than {MAX_XML_DEPTH} deep (the file is damaged)");
+    // the scan bounds the parser's recursion ...
     if nesting_depth(text.as_bytes(), MAX_XML_DEPTH) > MAX_XML_DEPTH {
-        return Err(format!("elements are nested more than {MAX_XML_DEPTH} deep (the file is damaged)"));
+        return Err(too_deep());
     }
     let opts = roxmltree::ParsingOptions { allow_dtd: true, ..Default::default() };
-    roxmltree::Document::parse_with_options(text, opts).map_err(|e| e.to_string())
+    let doc = roxmltree::Document::parse_with_options(text, opts).map_err(|e| e.to_string())?;
+    // ... and this the importers', which recurse over the tree, however the parser built it
+    if tree_depth(&doc) > MAX_XML_DEPTH {
+        return Err(too_deep());
+    }
+    Ok(doc)
 }
 
 #[cfg(test)]
@@ -304,8 +327,11 @@ mod tests {
         // the element nesting the parser reaches, for documents it accepts
         let parsed = |s: &str| {
             let doc = parse(s).unwrap();
-            doc.descendants().map(|n| n.ancestors().filter(|a| a.is_element()).count()).max().unwrap_or(0)
+            let depth = doc.descendants().map(|n| n.ancestors().filter(|a| a.is_element()).count()).max().unwrap_or(0);
+            assert_eq!(tree_depth(&doc), depth, "{s}");
+            depth
         };
+        assert_eq!(parsed("<a><b><c/></b><d><e><f/></e></d><g/></a>"), 4);
         for s in [
             "<a><b/><c x=\"1\"><d></d></c></a>",
             "<?xml version=\"1.0\"?><!-- <x><x><x> --><a><![CDATA[<b><c>]]></a>",
@@ -333,5 +359,17 @@ mod tests {
         assert!(parse("<!DOCTYPE x [<!BOGUS> ]><x><y><z/></y></x>").is_err());
         let e = parse(&"<a>".repeat(MAX_XML_DEPTH + 1)).unwrap_err();
         assert!(e.contains("nested"), "{e}");
+        // an entity's markup must balance within it, so expansions cannot leave elements open to
+        // nest deeper than the scan counts (and `tree_depth` would refuse such a tree anyway)
+        let open = "<!DOCTYPE x [<!ENTITY o '<a>'><!ENTITY c '</a>'>]><x>";
+        let n = 1000;
+        for s in [
+            format!("{open}{}</x>", "&o;".repeat(n)),
+            format!("{open}{}{}</x>", "&o;".repeat(n), "&c;".repeat(n)),
+            format!("{open}{}{}</x>", "&o;".repeat(n), "</a>".repeat(n)),
+            format!("{open}{}", "&o;".repeat(n)),
+        ] {
+            assert!(parse(&s).is_err());
+        }
     }
 }
