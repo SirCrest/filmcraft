@@ -26,9 +26,9 @@ use filmcraft_time::{FrameRate, Tick, format_timecode_frames};
 use roxmltree::Node;
 
 use crate::common::{
-    Builder, MediaSpec, base_item, db_to_gain, empty_sequence, file_name, frames_round, gain_to_db, item_media, item_path, kind_from_ext, label_from, on_frame,
-    param, param_modified, path_to_file_url, rate_from_timebase, resolve_path, set_param, settings_for, standard_effects, timebase, transition_effect,
-    transition_name, unscaled,
+    Builder, MAX_TRACKS, MediaSpec, base_item, db_to_gain, empty_sequence, file_name, frames_round, gain_to_db, item_media, item_path, kind_from_ext,
+    label_from, on_frame, param, param_modified, path_to_file_url, rate_from_timebase, resolve_path, set_param, settings_for, standard_effects, timebase,
+    tracks_full_warning, transition_effect, transition_name, unscaled,
 };
 use crate::xml::{XmlWriter, bool_str, child, child_bool, child_f64, child_i64, child_text, children, elements, num, path_text};
 use crate::{Error, ExportOptions, Format, ImportOptions, Imported, Report, Result};
@@ -90,6 +90,11 @@ fn write_rate(w: &mut XmlWriter, rate: FrameRate) {
 // ---------------------------------------------------------------------------------------------
 // Import
 // ---------------------------------------------------------------------------------------------
+
+/// Deepest chain of nested sequences followed (each level recurses). A clip item nesting a sequence
+/// deeper than this is left out and reported; that sequence is still imported where the document
+/// lists it (at the top level or in a bin). Real projects nest a handful of levels.
+const MAX_NEST_DEPTH: usize = 32;
 
 struct PendingLink {
     seq: ItemId,
@@ -305,14 +310,21 @@ impl<'a, 'i> Imp<'a, 'i, '_> {
     /// Sequence item for a `<sequence>` element (definition or reference).
     fn sequence(&mut self, n: Node<'a, 'i>, bin: Option<BinId>) -> Option<ItemId> {
         let key = node_key(n);
+        // Before the cache: a sequence being built is already cached (reserved), and nesting it in
+        // itself would make a cycle.
+        if self.in_progress.contains(&key) {
+            self.report.warn("recursive nested sequence ignored");
+            return None;
+        }
         if let Some(id) = self.seq_items.get(&key) {
             return Some(*id);
         }
         let def = if child(n, "media").is_some() { n } else { *self.seq_defs.get(&key)? };
-        if !self.in_progress.insert(key.clone()) {
-            self.report.warn("recursive nested sequence ignored");
+        if self.in_progress.len() >= MAX_NEST_DEPTH {
+            self.report.warn(format!("sequences nested more than {MAX_NEST_DEPTH} deep were left out"));
             return None;
         }
+        self.in_progress.insert(key.clone());
         let name = child_text(def, "name").unwrap_or("Sequence").to_string();
         let rate = read_rate(def).unwrap_or_default();
         let tc = child(def, "timecode");
@@ -342,6 +354,10 @@ impl<'a, 'i> Imp<'a, 'i, '_> {
         for (kind, tag) in [(TrackKind::Video, "video"), (TrackKind::Audio, "audio")] {
             let Some(m) = media.and_then(|m| child(m, tag)) else { continue };
             for (ti, tn) in children(m, "track").enumerate() {
+                if ti >= MAX_TRACKS {
+                    self.report.warn(format!("{tag} tracks beyond {MAX_TRACKS} were left out"));
+                    break;
+                }
                 self.b.ensure_tracks(&mut seq, kind, ti + 1);
                 self.track(&mut seq, id, kind, ti, tn, rate, (w, h));
             }
@@ -369,17 +385,23 @@ impl<'a, 'i> Imp<'a, 'i, '_> {
             match c.tag_name().name() {
                 "clipitem" | "generatoritem" => {
                     if let Some((ti_item, refs)) = self.clip_item(c, kind, rate, frame) {
-                        let xml_id = node_key(c);
-                        self.xml_clip_ids.insert((seq_id, xml_id), ti_item.id);
-                        if !refs.is_empty() {
-                            self.links.push(PendingLink { seq: seq_id, kind, track: ti, clip: ti_item.id, refs });
-                        }
+                        let clip = ti_item.id;
                         let t = &mut seq.tracks_mut(kind)[ti];
-                        if t.items.iter().any(|o| o.start < ti_item.end() && ti_item.start < o.end()) {
+                        let placed = if t.items.iter().any(|o| o.start < ti_item.end() && ti_item.start < o.end()) {
                             self.report.warn("overlapping clip items on one track; the later one was moved to a new track");
-                            self.b.place(seq, kind, ti + 1, ti_item);
+                            self.b.place(seq, kind, ti + 1, ti_item).is_some()
                         } else {
                             t.items.push(ti_item);
+                            true
+                        };
+                        if !placed {
+                            // No track left: the clip is not in the sequence, so links must not count it.
+                            self.report.warn(tracks_full_warning());
+                            continue;
+                        }
+                        self.xml_clip_ids.insert((seq_id, node_key(c)), clip);
+                        if !refs.is_empty() {
+                            self.links.push(PendingLink { seq: seq_id, kind, track: ti, clip, refs });
                         }
                     }
                 }

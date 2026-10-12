@@ -245,3 +245,39 @@ pub fn only_seq(imp: &Imported) -> ItemId {
 pub fn f(rate: FrameRate, n: i64) -> Tick {
     rate.tick_of(n)
 }
+
+/// Stack size for [`on_small_stack`]: the default main-thread stack on Windows.
+pub const SMALL_STACK: usize = 1024 * 1024;
+
+/// Run `f` on a thread with a [`SMALL_STACK`] stack, so unbounded recursion overflows quickly
+/// and independently of the test harness's thread size (and recursion that is bounded is shown to
+/// fit the smallest stack an import may run on).
+pub fn on_small_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    std::thread::Builder::new().stack_size(SMALL_STACK).spawn(f).unwrap().join().unwrap()
+}
+
+/// How many clips of `seq` carry a link that no other clip of `seq` shares (linked to nothing).
+pub fn lone_links(p: &Project, seq: ItemId) -> usize {
+    let mut members: std::collections::HashMap<u64, usize> = Default::default();
+    for t in p.sequence(seq).unwrap().all_tracks() {
+        for l in t.items.iter().filter_map(|c| c.link) {
+            *members.entry(l).or_default() += 1;
+        }
+    }
+    members.values().filter(|n| **n == 1).count()
+}
+
+/// How many sequences deep the first clip on V1 nests, starting at `seq`: 0 when `seq`'s first V1
+/// clip is not a nested sequence. Panics on a nesting cycle.
+pub fn nest_depth(p: &Project, seq: ItemId) -> usize {
+    let mut depth = 0;
+    let mut cur = seq;
+    while let Some(next) =
+        p.sequence(cur).and_then(|s| s.tracks(TrackKind::Video).first()).and_then(|t| t.items.first()).map(|c| c.item).filter(|i| p.sequence(*i).is_some())
+    {
+        depth += 1;
+        assert!(depth <= 1_000_000, "nested sequences form a cycle");
+        cur = next;
+    }
+    depth
+}

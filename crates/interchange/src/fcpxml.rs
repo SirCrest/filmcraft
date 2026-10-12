@@ -14,7 +14,7 @@
 //!   clip markers. Transitions are supported on the primary storyline (and read from secondary
 //!   storylines); transitions elsewhere are reported.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use filmcraft_geom::Vec2;
 use filmcraft_media::MediaKind;
@@ -26,8 +26,8 @@ use filmcraft_time::{FrameRate, TICKS_PER_SECOND, Tick};
 use roxmltree::Node;
 
 use crate::common::{
-    Builder, MediaSpec, base_item, db_to_gain, empty_sequence, file_name, gain_to_db, generator_of, item_media, item_path, kind_from_ext, param,
-    param_modified, path_to_file_url, resolve_path, scaled, set_param, settings_for, standard_effects, transition_effect, transition_name,
+    Builder, MAX_TRACKS, MediaSpec, base_item, db_to_gain, empty_sequence, file_name, gain_to_db, generator_of, item_media, item_path, kind_from_ext, param,
+    param_modified, path_to_file_url, resolve_path, scaled, set_param, settings_for, standard_effects, tracks_full_warning, transition_effect, transition_name,
 };
 use crate::xml::{child, children, elements, num};
 use crate::{Error, ExportOptions, Format, ImportOptions, Imported, Report, Result};
@@ -115,6 +115,17 @@ fn parse_audio_rate(s: &str) -> Option<u32> {
 // Import
 // ---------------------------------------------------------------------------------------------
 
+/// Deepest nesting of storyline elements laid out: connected clips inside clips and compound clips
+/// inside compound clips both count, so the bound holds however the two are combined (each level
+/// recurses). Deeper elements are skipped and reported; real projects nest a handful of levels.
+const MAX_NEST_DEPTH: usize = 32;
+
+/// Connected-clip lanes imported, as the exporter writes them: lane `n` is track index `n` (lane 1 is
+/// V2) and lane `-n` is audio track An, so V999 is lane 998 and A999 is lane `-999`. Lanes outside
+/// are clamped so a hostile lane can't ask for billions of tracks.
+const MAX_LANE: i32 = MAX_TRACKS as i32 - 1;
+const MIN_LANE: i32 = -(MAX_TRACKS as i32);
+
 #[derive(Clone)]
 struct Asset {
     item: ItemId,
@@ -132,6 +143,10 @@ struct Imp<'a, 'i, 'r> {
     assets: HashMap<String, Asset>,
     media_nodes: HashMap<String, Node<'a, 'i>>,
     media_items: HashMap<String, ItemId>,
+    /// Compound clips (`<media>` ids) being laid out: a reference back to one is a cycle.
+    media_in_progress: HashSet<String>,
+    /// Storyline elements being laid out (see [`MAX_NEST_DEPTH`]).
+    depth: usize,
     effects: HashMap<String, String>,
 }
 
@@ -163,6 +178,8 @@ pub(crate) fn import(text: &str, opts: &ImportOptions, report: &mut Report) -> R
         assets: HashMap::new(),
         media_nodes: HashMap::new(),
         media_items: HashMap::new(),
+        media_in_progress: HashSet::new(),
+        depth: 0,
         effects: HashMap::new(),
     };
     if let Some(res) = child(root, "resources") {
@@ -281,9 +298,15 @@ impl<'a, 'i> Imp<'a, 'i, '_> {
         }
         let n = *self.media_nodes.get(id)?;
         let s = child(n, "sequence")?;
-        // Reserve first so recursion terminates.
+        // A compound clip that uses itself (directly or through others) would recurse forever. Long
+        // chains of distinct compound clips are bounded by `MAX_NEST_DEPTH` in `element`.
+        if !self.media_in_progress.insert(id.to_string()) {
+            self.report.warn("recursive compound clip ignored");
+            return None;
+        }
         let name = n.attribute("name").unwrap_or("Compound Clip").to_string();
         let item = self.sequence(s, &name, None);
+        self.media_in_progress.remove(id);
         self.media_items.insert(id.into(), item);
         Some(item)
     }
@@ -371,7 +394,27 @@ impl<'a, 'i> Imp<'a, 'i, '_> {
     }
 
     /// Lay out one storyline element at timeline time `t0`. Returns (timeline end, video clip).
+    /// Elements nested more than [`MAX_NEST_DEPTH`] deep are skipped.
     fn element(&mut self, seq: &mut Sequence, ctx: &Ctx, el: Node<'a, 'i>, t0: Tick, lane: i32, primary: bool) -> (Tick, Option<filmcraft_project::ClipId>) {
+        if self.depth >= MAX_NEST_DEPTH {
+            self.report.warn(format!("clips nested more than {MAX_NEST_DEPTH} deep (connected clips or compound clips) were left out"));
+            return (t0 + attr_time(el, "duration").unwrap_or(Tick::ZERO), None);
+        }
+        self.depth += 1;
+        let laid = self.lay_element(seq, ctx, el, t0, lane, primary);
+        self.depth -= 1;
+        laid
+    }
+
+    fn lay_element(
+        &mut self,
+        seq: &mut Sequence,
+        ctx: &Ctx,
+        el: Node<'a, 'i>,
+        t0: Tick,
+        lane: i32,
+        primary: bool,
+    ) -> (Tick, Option<filmcraft_project::ClipId>) {
         let tag = el.tag_name().name();
         let dur = attr_time(el, "duration").unwrap_or(Tick::ZERO);
         let local_start = attr_time(el, "start").unwrap_or(Tick::ZERO);
@@ -437,18 +480,28 @@ impl<'a, 'i> Imp<'a, 'i, '_> {
                     TrackKind::Video => lane.max(0) as usize,
                     TrackKind::Audio => {
                         if lane < 0 {
-                            (-lane - 1) as usize
+                            (lane.unsigned_abs() as usize).saturating_sub(1)
                         } else {
                             lane as usize
                         }
                     }
                 };
                 let id = ti.id;
-                self.b.place(seq, kind, pref, ti);
+                if self.b.place(seq, kind, pref, ti).is_none() {
+                    self.report.warn(tracks_full_warning());
+                    continue;
+                }
                 placed.push((kind, id));
                 if kind == TrackKind::Video {
                     vclip = Some(id);
                 }
+            }
+            // One half of an A/V clip found no track: the other must not keep a link with no partner.
+            if link.is_some()
+                && let [(_, id)] = placed.as_slice()
+                && let Some((_, it)) = seq.find_item_mut(*id)
+            {
+                it.link = None;
             }
         }
         if primary {
@@ -462,7 +515,11 @@ impl<'a, 'i> Imp<'a, 'i, '_> {
             let Some(l) = c.attribute("lane").and_then(|l| l.parse::<i32>().ok()) else { continue };
             let off = attr_time(c, "offset").unwrap_or(Tick::ZERO);
             let ct0 = t0 + (off - local_start);
-            let clane = if lane > 0 && l > 0 { lane + l } else { l };
+            let nested = if lane > 0 && l > 0 { lane.saturating_add(l) } else { l };
+            let clane = nested.clamp(MIN_LANE, MAX_LANE);
+            if clane != nested {
+                self.report.warn(format!("connected clips on lanes outside {MIN_LANE}…{MAX_LANE} were moved to the nearest of those lanes"));
+            }
             if c.has_tag_name("spine") {
                 // Secondary storyline: children offsets are in the storyline's local time.
                 let first = elements(c).filter(|x| !x.has_tag_name("transition")).find_map(|x| attr_time(x, "offset")).unwrap_or(Tick::ZERO);
@@ -471,7 +528,6 @@ impl<'a, 'i> Imp<'a, 'i, '_> {
                 self.element(seq, ctx, c, ct0, clane, false);
             }
         }
-        let _ = placed;
         (t0 + dur, vclip)
     }
 
