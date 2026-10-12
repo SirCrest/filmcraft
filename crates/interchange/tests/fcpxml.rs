@@ -3,7 +3,7 @@
 
 mod support;
 
-use filmcraft_interchange::{ExportOptions, FcpxmlVersion, Format, detect, import};
+use filmcraft_interchange::{ExportOptions, FcpxmlVersion, Format, MAX_XML_DEPTH, detect, import};
 use filmcraft_project::{ItemKind, Keyframe, Label, Marker, MarkerId, MarkerKind, MediaRef, Param, ParamValue, Project, TrackKind, TransitionAlign};
 use filmcraft_time::FrameRate;
 use proptest::prelude::*;
@@ -340,5 +340,38 @@ proptest! {
         prop_assert_eq!(structure(&imp.project, si, TrackKind::Video), structure(&p, s, TrackKind::Video), "{}", text);
         prop_assert_eq!(structure(&imp.project, si, TrackKind::Audio), structure(&p, s, TrackKind::Audio), "{}", text);
         prop_assert_eq!(links(&imp.project, si), links(&p, s));
+    }
+}
+
+/// Damaged or hostile documents nested far deeper than any real one are refused before parsing: the
+/// XML parser recurses per element level and would overflow the stack.
+#[test]
+fn deeply_nested_xml_does_not_overflow_the_stack() {
+    let mut docs = deeply_nested("fcpxml");
+    docs.push(doc().replace("<event name=\"Day 1\">", &format!("<event name=\"Day 1\">{}", nest("a", 100_000))));
+    for xml in docs {
+        let e = on_small_stack(move || import(xml.as_bytes(), Format::Fcpxml, None).err().map(|e| e.to_string())).unwrap_or_default();
+        assert!(e.contains("nested"), "{e}");
+    }
+    // at the limit imports, even on a small stack (one level more does not)
+    let at = |n: usize| doc().replace("<event name=\"Day 1\">", &format!("<event name=\"Day 1\">{}", nest("a", n)));
+    let (ok, over) = (at(MAX_XML_DEPTH - 3), at(MAX_XML_DEPTH - 2));
+    assert!(on_small_stack(move || import(ok.as_bytes(), Format::Fcpxml, None).is_ok()));
+    assert!(import(over.as_bytes(), Format::Fcpxml, None).is_err());
+    // connected clips in connected clips, and storylines in clips, to the limit: the importer
+    // recurses per level too
+    let clip = r#"<asset-clip ref="r2" offset="0s" duration="1s">"#;
+    for (open, close) in [
+        (r#"<asset-clip ref="r2" lane="1" offset="0s" duration="1s">"#, "</asset-clip>"),
+        (&format!(r#"<spine lane="1" offset="0s">{clip}"#), "</asset-clip></spine>"),
+    ] {
+        let levels = (MAX_XML_DEPTH - 7) / open.matches('<').count();
+        let doc = format!(
+            r#"<fcpxml version="1.10"><resources><format id="r1" frameDuration="1/25s" width="1920" height="1080"/><asset id="r2" name="Shot" start="0s" duration="10s" hasVideo="1" format="r1"><media-rep kind="original-media" src="file:///m/shot.mov"/></asset></resources><library><event name="E"><project name="P"><sequence format="r1"><spine>{clip}{}{}</asset-clip></spine></sequence></project></event></library></fcpxml>"#,
+            open.repeat(levels),
+            close.repeat(levels)
+        );
+        let (imp, _) = on_small_stack(move || import(doc.as_bytes(), Format::Fcpxml, None)).unwrap();
+        assert_eq!(imp.project.sequence(only_seq(&imp)).unwrap().video_tracks.len(), levels + 1);
     }
 }
