@@ -385,19 +385,23 @@ impl<'a, 'i> Imp<'a, 'i, '_> {
             match c.tag_name().name() {
                 "clipitem" | "generatoritem" => {
                     if let Some((ti_item, refs)) = self.clip_item(c, kind, rate, frame) {
-                        let xml_id = node_key(c);
-                        self.xml_clip_ids.insert((seq_id, xml_id), ti_item.id);
-                        if !refs.is_empty() {
-                            self.links.push(PendingLink { seq: seq_id, kind, track: ti, clip: ti_item.id, refs });
-                        }
+                        let clip = ti_item.id;
                         let t = &mut seq.tracks_mut(kind)[ti];
-                        if t.items.iter().any(|o| o.start < ti_item.end() && ti_item.start < o.end()) {
+                        let placed = if t.items.iter().any(|o| o.start < ti_item.end() && ti_item.start < o.end()) {
                             self.report.warn("overlapping clip items on one track; the later one was moved to a new track");
-                            if self.b.place(seq, kind, ti + 1, ti_item).is_none() {
-                                self.report.warn(tracks_full_warning());
-                            }
+                            self.b.place(seq, kind, ti + 1, ti_item).is_some()
                         } else {
                             t.items.push(ti_item);
+                            true
+                        };
+                        if !placed {
+                            // No track left: the clip is not in the sequence, so links must not count it.
+                            self.report.warn(tracks_full_warning());
+                            continue;
+                        }
+                        self.xml_clip_ids.insert((seq_id, node_key(c)), clip);
+                        if !refs.is_empty() {
+                            self.links.push(PendingLink { seq: seq_id, kind, track: ti, clip, refs });
                         }
                     }
                 }

@@ -60,7 +60,8 @@ A sequence that claims to be inside itself (a damaged project or file) is a gap 
 entry in both directions; nothing recurses without a bound. Nesting is followed at most 32 levels
 deep (FCP7 nested sequences; FCPXML connected and compound clips counted together) and deeper clips
 are left out with a report entry. An import makes at most 999 tracks of a kind (the editor's limit):
-FCPXML lanes beyond ±998 are clamped, and clips that would need more tracks are left out and reported.
+FCPXML lanes outside −999…998 (A999 to V999, as the exporter writes them) are clamped, and clips that
+would need more tracks are left out and reported (an A/V clip that keeps only one half is unlinked).
 
 The AAF reader also accepts Premiere Pro's layout of a composition: all video tracks in ONE slot
 (a nested scope with a segment per track, lowest first), and "top-level" tagged on nested

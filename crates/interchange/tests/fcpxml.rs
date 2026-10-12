@@ -457,3 +457,37 @@ fn hostile_lanes_are_clamped_to_the_track_limit() {
         assert!(tracks.last().is_some_and(|t| t.items.len() == 1), "{spine}: the clip lands on the top track");
     }
 }
+
+/// The exporter writes A999 as lane -999 (audio lanes are `-(track index + 1)`): it imports onto
+/// A999 unclamped; only lanes past it are clamped.
+#[test]
+fn audio_lane_minus_999_is_the_last_audio_track() {
+    let asset = r#"<asset id="a1" name="Take" start="0s" duration="10s" hasVideo="1" hasAudio="1" format="r1"><media-rep kind="original-media" src="file:///m/take.mov"/></asset>"#;
+    for (lane, clamped) in [(-999, false), (-1000, true)] {
+        let spine = format!(
+            r#"<asset-clip ref="a1" offset="0s" duration="5s" srcEnable="video"><asset-clip ref="a1" lane="{lane}" offset="0s" duration="1s" srcEnable="audio"/></asset-clip>"#
+        );
+        let (imp, rep) = import_on_small_stack(fcpxml_doc(asset, &spine));
+        assert_eq!(rep.mentions("lanes outside"), clamped, "lane {lane}: {rep:?}");
+        let audio = imp.project.sequence(only_seq(&imp)).unwrap().tracks(TrackKind::Audio);
+        assert_eq!(audio.len(), 999, "lane {lane}");
+        assert_eq!(audio[998].items.len(), 1, "lane {lane}");
+    }
+}
+
+/// With every video track taken, an A/V connected clip's audio is placed but its video is left out;
+/// the audio kept the pair's link, linked to nothing.
+#[test]
+fn an_av_clip_whose_video_finds_no_track_keeps_no_link() {
+    let asset = r#"<asset id="a1" name="Take" start="0s" duration="10s" hasVideo="1" hasAudio="1" format="r1"><media-rep kind="original-media" src="file:///m/take.mov"/></asset>"#;
+    let fill: String = (1..=998).map(|k| format!(r#"<asset-clip ref="a1" lane="{k}" offset="0s" duration="1s" srcEnable="video"/>"#)).collect();
+    let spine = format!(
+        r#"<asset-clip ref="a1" offset="0s" duration="5s" srcEnable="video">{fill}<asset-clip ref="a1" lane="1" offset="0s" duration="1s"/></asset-clip>"#
+    );
+    let (imp, rep) = import_on_small_stack(fcpxml_doc(asset, &spine));
+    assert!(rep.mentions("999 tracks"), "{rep:?}");
+    let seq = only_seq(&imp);
+    let audio = imp.project.sequence(seq).unwrap().tracks(TrackKind::Audio);
+    assert_eq!(audio.iter().map(|t| t.items.len()).sum::<usize>(), 1, "the audio half is placed");
+    assert_eq!(lone_links(&imp.project, seq), 0);
+}

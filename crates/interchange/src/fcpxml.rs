@@ -120,9 +120,11 @@ fn parse_audio_rate(s: &str) -> Option<u32> {
 /// recurses). Deeper elements are skipped and reported; real projects nest a handful of levels.
 const MAX_NEST_DEPTH: usize = 32;
 
-/// Highest connected-clip lane imported (lane `n` is track `n`, lane `-n` audio track `n`); lanes
-/// beyond it are clamped so a hostile lane can't ask for billions of tracks.
+/// Connected-clip lanes imported, as the exporter writes them: lane `n` is track index `n` (lane 1 is
+/// V2) and lane `-n` is audio track An, so V999 is lane 998 and A999 is lane `-999`. Lanes outside
+/// are clamped so a hostile lane can't ask for billions of tracks.
 const MAX_LANE: i32 = MAX_TRACKS as i32 - 1;
+const MIN_LANE: i32 = -(MAX_TRACKS as i32);
 
 #[derive(Clone)]
 struct Asset {
@@ -494,6 +496,13 @@ impl<'a, 'i> Imp<'a, 'i, '_> {
                     vclip = Some(id);
                 }
             }
+            // One half of an A/V clip found no track: the other must not keep a link with no partner.
+            if link.is_some()
+                && let [(_, id)] = placed.as_slice()
+                && let Some((_, it)) = seq.find_item_mut(*id)
+            {
+                it.link = None;
+            }
         }
         if primary {
             // Markers on primary storyline elements are timeline markers.
@@ -507,9 +516,9 @@ impl<'a, 'i> Imp<'a, 'i, '_> {
             let off = attr_time(c, "offset").unwrap_or(Tick::ZERO);
             let ct0 = t0 + (off - local_start);
             let nested = if lane > 0 && l > 0 { lane.saturating_add(l) } else { l };
-            let clane = nested.clamp(-MAX_LANE, MAX_LANE);
+            let clane = nested.clamp(MIN_LANE, MAX_LANE);
             if clane != nested {
-                self.report.warn(format!("connected clips on lanes beyond ±{MAX_LANE} were moved to lane ±{MAX_LANE}"));
+                self.report.warn(format!("connected clips on lanes outside {MIN_LANE}…{MAX_LANE} were moved to the nearest of those lanes"));
             }
             if c.has_tag_name("spine") {
                 // Secondary storyline: children offsets are in the storyline's local time.
@@ -519,7 +528,6 @@ impl<'a, 'i> Imp<'a, 'i, '_> {
                 self.element(seq, ctx, c, ct0, clane, false);
             }
         }
-        let _ = placed;
         (t0 + dur, vclip)
     }
 

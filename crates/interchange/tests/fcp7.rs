@@ -675,3 +675,37 @@ fn an_import_makes_at_most_999_tracks_of_a_kind() {
         assert_eq!(video.len(), 999);
     }
 }
+
+/// A clip item dropped at the track limit was still counted when links were resolved, so the audio
+/// linked to it kept a link to nothing.
+#[test]
+fn a_clip_dropped_at_the_track_limit_leaves_no_lone_link() {
+    let file = format!(
+        r#"<file id="f1"><name>take.mov</name><pathurl>file://localhost/m/take.mov</pathurl>{RATE}<duration>96</duration><media><video/><audio><channelcount>2</channelcount></audio></media></file>"#
+    );
+    let clip = |id: &str, start: i64, file: &str, links: &[&str]| {
+        let links: String = links.iter().map(|l| format!("<link><linkclipref>{l}</linkclipref></link>")).collect();
+        format!(r#"<clipitem id="{id}"><name>t</name><start>{start}</start><end>{}</end><in>0</in><out>24</out>{file}{links}</clipitem>"#, start + 24)
+    };
+    let fref = r#"<file id="f1"/>"#;
+    // c1…c999 fill V1…V999; c1000 finds no track. c1 is linked to a2 (kept); c1000 to a1.
+    let video: String = (1..=1000)
+        .map(|k| {
+            let links: &[&str] = match k {
+                1 => &["c1", "a2"],
+                1000 => &["c1000", "a1"],
+                _ => &[],
+            };
+            clip(&format!("c{k}"), 0, if k == 1 { &file } else { fref }, links)
+        })
+        .collect();
+    let audio = format!("{}{}", clip("a1", 0, fref, &["c1000", "a1"]), clip("a2", 24, fref, &["c1", "a2"]));
+    let doc = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE xmeml><xmeml version="4"><sequence id="s1"><name>S</name><duration>48</duration>{RATE}<media><video><track>{video}</track></video><audio><track>{audio}</track></audio></media></sequence></xmeml>"#
+    );
+    let (imp, rep) = import_on_small_stack(doc);
+    assert!(rep.mentions("999 tracks"), "{rep:?}");
+    let seq = only_seq(&imp);
+    assert_eq!(lone_links(&imp.project, seq), 0);
+    assert_eq!(links(&imp.project, seq), vec![vec![(0, 0, 0), (1, 0, 1)]], "c1 and a2 stay linked");
+}

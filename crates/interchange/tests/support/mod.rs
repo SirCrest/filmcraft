@@ -256,6 +256,17 @@ pub fn on_small_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static)
     std::thread::Builder::new().stack_size(SMALL_STACK).spawn(f).unwrap().join().unwrap()
 }
 
+/// How many clips of `seq` carry a link that no other clip of `seq` shares (linked to nothing).
+pub fn lone_links(p: &Project, seq: ItemId) -> usize {
+    let mut members: std::collections::HashMap<u64, usize> = Default::default();
+    for t in p.sequence(seq).unwrap().all_tracks() {
+        for l in t.items.iter().filter_map(|c| c.link) {
+            *members.entry(l).or_default() += 1;
+        }
+    }
+    members.values().filter(|n| **n == 1).count()
+}
+
 /// How many sequences deep the first clip on V1 nests, starting at `seq`: 0 when `seq`'s first V1
 /// clip is not a nested sequence. Panics on a nesting cycle.
 pub fn nest_depth(p: &Project, seq: ItemId) -> usize {
