@@ -57,7 +57,10 @@ Premiere Pro does not write FCPXML.
 | OMF | the nested sequence's sound, mixed by the engine with what is on the clip (`NestNeeds::Render`), as one clip named after the sequence. Without that essence: a gap, and the report names the sequence | media in the document |
 
 A sequence that claims to be inside itself (a damaged project or file) is a gap with a report
-entry in both directions; nothing recurses without a bound.
+entry in both directions; nothing recurses without a bound. Nesting is followed at most 32 levels
+deep (FCP7 nested sequences; FCPXML connected and compound clips counted together) and deeper clips
+are left out with a report entry. An import makes at most 999 tracks of a kind (the editor's limit):
+FCPXML lanes beyond ±998 are clamped, and clips that would need more tracks are left out and reported.
 
 The AAF reader also accepts Premiere Pro's layout of a composition: all video tracks in ONE slot
 (a nested scope with a segment per track, lowest first), and "top-level" tagged on nested

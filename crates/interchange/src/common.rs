@@ -337,6 +337,15 @@ pub(crate) fn generator_of(p: &Project, id: ItemId) -> Option<&Generator> {
 // Fragment builder
 // ---------------------------------------------------------------------------------------------
 
+/// Most tracks of one kind an import makes: the editor's own limit (`MAX_TRACKS` in the engine's
+/// `sequence_tools`), so a hostile lane or track number can't make an import allocate billions of tracks.
+pub(crate) const MAX_TRACKS: usize = 999;
+
+/// Report message for clips [`Builder::place`] found no room for under [`MAX_TRACKS`].
+pub(crate) fn tracks_full_warning() -> String {
+    format!("clips that would need more than {MAX_TRACKS} tracks of a kind were left out")
+}
+
 pub(crate) struct Builder {
     pub p: Project,
     media: HashMap<String, ItemId>,
@@ -461,20 +470,20 @@ impl Builder {
         }
     }
 
-    /// Place `item` on the first track at or after `preferred` where it does not overlap anything,
-    /// creating tracks as needed. Returns the track index.
-    pub fn place(&mut self, seq: &mut Sequence, kind: TrackKind, preferred: usize, item: TrackItem) -> usize {
-        let mut i = preferred;
-        loop {
+    /// Place `item` on the first track at or after `preferred` (at most the last of [`MAX_TRACKS`])
+    /// where it does not overlap anything, creating tracks as needed. Returns the track index, or `None`
+    /// when every track up to the limit is taken (the item is dropped; report [`tracks_full_warning`]).
+    pub fn place(&mut self, seq: &mut Sequence, kind: TrackKind, preferred: usize, item: TrackItem) -> Option<usize> {
+        for i in preferred.min(MAX_TRACKS - 1)..MAX_TRACKS {
             self.ensure_tracks(seq, kind, i + 1);
-            let t = &mut seq.tracks_mut(kind)[i];
+            let t = seq.tracks_mut(kind).get_mut(i)?;
             if !t.items.iter().any(|o| o.start < item.end() && item.start < o.end()) {
                 t.items.push(item);
                 t.sort();
-                return i;
+                return Some(i);
             }
-            i += 1;
         }
+        None
     }
 
     /// Finish: grow media durations to cover every use, return the fragment.

@@ -600,3 +600,78 @@ fn audio_trackindex_1_is_channel_0_only_when_the_file_is_split() {
     assert!(a1[1].source_channels.is_empty(), "{:?}", a1[1].source_channels);
     assert_eq!(seq.tracks(TrackKind::Audio)[1].items[0].source_channels, vec![1u16]);
 }
+
+/// `n` top-level sequences (`s1`…`sn`), each holding a clip item that nests the next one.
+fn nested_sequence_chain(n: usize) -> String {
+    use std::fmt::Write as _;
+    let mut seqs = String::new();
+    for k in 1..=n {
+        let next = if k < n {
+            format!(r#"<clipitem id="c{k}"><name>n{k}</name><start>0</start><end>24</end><in>0</in><out>24</out><sequence id="s{}"/></clipitem>"#, k + 1)
+        } else {
+            String::new()
+        };
+        let _ =
+            write!(seqs, r#"<sequence id="s{k}"><name>S{k}</name><duration>24</duration>{RATE}<media><video><track>{next}</track></video></media></sequence>"#);
+    }
+    format!(r#"<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE xmeml><xmeml version="4">{seqs}</xmeml>"#)
+}
+
+fn import_on_small_stack(xml: String) -> (filmcraft_interchange::Imported, filmcraft_interchange::Report) {
+    on_small_stack(move || import(xml.as_bytes(), Format::Fcp7Xml, None).unwrap())
+}
+
+/// A chain of distinct nested sequences recursed once per link: 20 000 overflowed an 8 MB stack. The
+/// chain is now cut at a fixed depth (the cut clip is left out and reported), every sequence is still
+/// imported, and ordinary nesting imports whole.
+#[test]
+fn a_long_chain_of_nested_sequences_is_cut_at_a_fixed_depth() {
+    let n = 20_000;
+    let (imp, rep) = import_on_small_stack(nested_sequence_chain(n));
+    assert!(rep.mentions("nested more than"), "{rep:?}");
+    assert_eq!(imp.sequences.len(), n);
+    let depth = nest_depth(&imp.project, imp.sequences[0]);
+    assert!((16..=100).contains(&depth), "nesting cut at {depth}");
+    assert_eq!(imp.project.nest_cycle(), None);
+
+    let (imp, rep) = import_on_small_stack(nested_sequence_chain(10));
+    assert!(!rep.has_warnings(), "{rep:?}");
+    assert_eq!(nest_depth(&imp.project, imp.sequences[0]), 9);
+}
+
+/// Sequences nesting each other (s1 → s2 → s1) imported as a cycle: the cached reservation of s1 was
+/// returned before the in-progress check could see it.
+#[test]
+fn sequences_nesting_each_other_are_cut_at_the_repeat() {
+    let doc = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE xmeml><xmeml version="4">
+<sequence id="s1"><name>A</name><duration>24</duration>{RATE}<media><video><track><clipitem id="c1"><name>b</name><start>0</start><end>24</end><in>0</in><out>24</out><sequence id="s2"/></clipitem></track></video></media></sequence>
+<sequence id="s2"><name>B</name><duration>24</duration>{RATE}<media><video><track><clipitem id="c2"><name>a</name><start>0</start><end>24</end><in>0</in><out>24</out><sequence id="s1"/></clipitem></track></video></media></sequence>
+</xmeml>"#
+    );
+    let (imp, rep) = import_on_small_stack(doc);
+    assert!(rep.mentions("recursive nested sequence"), "{rep:?}");
+    assert_eq!(imp.project.nest_cycle(), None);
+    assert_eq!(nest_depth(&imp.project, imp.sequences[0]), 1);
+}
+
+/// Tracks come from the file: an import makes at most 999 of a kind (the editor's limit), whether
+/// from `<track>` elements or from overlapping clip items moved to new tracks.
+#[test]
+fn an_import_makes_at_most_999_tracks_of_a_kind() {
+    let file = format!(
+        r#"<file id="f1"><name>take.mov</name><pathurl>file://localhost/m/take.mov</pathurl>{RATE}<duration>48</duration><media><video/></media></file>"#
+    );
+    let clip = |k: usize, file: &str| format!(r#"<clipitem id="c{k}"><name>t</name><start>0</start><end>24</end><in>0</in><out>24</out>{file}</clipitem>"#);
+    let overlapping: String = (1..=1001).map(|k| clip(k, if k == 1 { &file } else { r#"<file id="f1"/>"# })).collect();
+    let many_tracks = format!("{}<track>{}</track>", "<track/>".repeat(1000), clip(0, &file));
+    for (tracks, warning) in [(format!("<track>{overlapping}</track>"), "999 tracks"), (many_tracks, "beyond 999")] {
+        let doc = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE xmeml><xmeml version="4"><sequence id="s1"><name>S</name><duration>24</duration>{RATE}<media><video>{tracks}</video></media></sequence></xmeml>"#
+        );
+        let (imp, rep) = import_on_small_stack(doc);
+        assert!(rep.mentions(warning), "{rep:?}");
+        let video = imp.project.sequence(only_seq(&imp)).unwrap().tracks(TrackKind::Video);
+        assert_eq!(video.len(), 999);
+    }
+}

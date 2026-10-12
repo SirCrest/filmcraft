@@ -342,3 +342,118 @@ proptest! {
         prop_assert_eq!(links(&imp.project, si), links(&p, s));
     }
 }
+
+/// A 25 fps FCPXML document with extra `resources` and a project whose primary storyline holds `spine`.
+fn fcpxml_doc(resources: &str, spine: &str) -> String {
+    format!(
+        r#"<fcpxml version="1.10"><resources><format id="r1" frameDuration="1/25s" width="1920" height="1080"/>{resources}</resources><library><event name="E"><project name="P"><sequence format="r1"><spine>{spine}</spine></sequence></project></event></library></fcpxml>"#
+    )
+}
+
+fn import_on_small_stack(xml: String) -> (filmcraft_interchange::Imported, filmcraft_interchange::Report) {
+    on_small_stack(move || import(xml.as_bytes(), Format::Fcpxml, None).unwrap())
+}
+
+/// `n` compound clips (`m1`…`mn`), each using the next; the project uses `m1`.
+fn compound_chain(n: usize) -> String {
+    use std::fmt::Write as _;
+    let mut res = String::new();
+    for k in 1..=n {
+        let inner = if k < n { format!(r#"<ref-clip ref="m{}" offset="0s" duration="1s"/>"#, k + 1) } else { r#"<gap offset="0s" duration="1s"/>"#.into() };
+        let _ = write!(res, r#"<media id="m{k}" name="C{k}"><sequence format="r1"><spine>{inner}</spine></sequence></media>"#);
+    }
+    fcpxml_doc(&res, r#"<ref-clip ref="m1" offset="0s" duration="1s"/>"#)
+}
+
+/// A compound clip whose sequence uses itself recursed until the stack overflowed (even on an 8 MB stack).
+#[test]
+fn a_self_referencing_compound_clip_is_reported_not_followed() {
+    let xml = fcpxml_doc(
+        r#"<media id="r6" name="Loop"><sequence format="r1"><spine><ref-clip ref="r6" offset="0s" duration="1s"/></spine></sequence></media>"#,
+        r#"<ref-clip ref="r6" offset="0s" duration="1s"/>"#,
+    );
+    let (imp, rep) = import_on_small_stack(xml);
+    assert!(rep.mentions("recursive compound clip"), "{rep:?}");
+    assert_eq!(imp.project.nest_cycle(), None);
+    assert_eq!(nest_depth(&imp.project, only_seq(&imp)), 1);
+}
+
+/// Compound clips using each other (m1 → m2 → m1) recursed without bound too.
+#[test]
+fn compound_clips_using_each_other_are_cut_at_the_repeat() {
+    let xml = fcpxml_doc(
+        r#"<media id="m1" name="A"><sequence format="r1"><spine><ref-clip ref="m2" offset="0s" duration="1s"/></spine></sequence></media>
+           <media id="m2" name="B"><sequence format="r1"><spine><ref-clip ref="m1" offset="0s" duration="1s"/></spine></sequence></media>"#,
+        r#"<ref-clip ref="m1" offset="0s" duration="1s"/>"#,
+    );
+    let (imp, rep) = import_on_small_stack(xml);
+    assert!(rep.mentions("recursive compound clip"), "{rep:?}");
+    assert_eq!(imp.project.nest_cycle(), None);
+    assert_eq!(nest_depth(&imp.project, only_seq(&imp)), 2);
+}
+
+/// A long chain of distinct compound clips recursed once per link and overflowed the stack; it is
+/// now cut at a fixed depth (reported), while ordinary nesting imports whole.
+#[test]
+fn a_long_chain_of_compound_clips_is_cut_at_a_fixed_depth() {
+    let (imp, rep) = import_on_small_stack(compound_chain(20_000));
+    assert!(rep.mentions("nested more than"), "{rep:?}");
+    let depth = nest_depth(&imp.project, only_seq(&imp));
+    assert!((16..=100).contains(&depth), "nesting cut at {depth}");
+
+    let (imp, rep) = import_on_small_stack(compound_chain(10));
+    assert!(!rep.has_warnings(), "{rep:?}");
+    assert_eq!(nest_depth(&imp.project, only_seq(&imp)), 10);
+}
+
+/// Compound clips multiply nesting: 100 compound clips, each holding connected clips nested 100 deep and
+/// then the next compound clip, recursed ~10 000 levels (stack overflow) although the XML is only ~110
+/// elements deep. The total nesting is cut at a fixed depth.
+#[test]
+fn nesting_through_connected_and_compound_clips_is_cut_at_a_fixed_depth() {
+    use std::fmt::Write as _;
+    let (n, deep) = (100, 100);
+    let mut res = String::from(
+        r#"<asset id="a1" name="Take" start="0s" duration="10s" hasVideo="1" format="r1"><media-rep kind="original-media" src="file:///m/take.mov"/></asset>"#,
+    );
+    for k in 1..=n {
+        let next = if k < n { format!(r#"<ref-clip ref="m{}" lane="1" offset="0s" duration="1s"/>"#, k + 1) } else { String::new() };
+        let _ = write!(
+            res,
+            r#"<media id="m{k}" name="C{k}"><sequence format="r1"><spine><asset-clip ref="a1" offset="0s" duration="1s">{}{next}{}</asset-clip></spine></sequence></media>"#,
+            r#"<asset-clip ref="a1" lane="1" offset="0s" duration="1s">"#.repeat(deep),
+            "</asset-clip>".repeat(deep)
+        );
+    }
+    let (imp, rep) = import_on_small_stack(fcpxml_doc(&res, r#"<ref-clip ref="m1" offset="0s" duration="1s"/>"#));
+    assert!(rep.mentions("nested more than"), "{rep:?}");
+    assert_eq!(imp.project.nest_cycle(), None);
+}
+
+/// Lanes come straight from the file: `lane + l` overflowed i32 (a panic) for a connected clip on lane
+/// `i32::MAX` inside one on lane 1, `-lane - 1` overflowed for lane `i32::MIN`, and any huge lane made
+/// the importer add tracks up to that number (billions: out of memory).
+#[test]
+fn hostile_lanes_are_clamped_to_the_track_limit() {
+    let asset = r#"<asset id="a1" name="Take" start="0s" duration="10s" hasVideo="1" hasAudio="1" format="r1"><media-rep kind="original-media" src="file:///m/take.mov"/></asset>"#;
+    for (spine, kind) in [
+        (
+            r#"<asset-clip ref="a1" offset="0s" duration="5s"><asset-clip ref="a1" lane="1" offset="0s" duration="2s" srcEnable="video"><asset-clip ref="a1" lane="2147483647" offset="0s" duration="1s" srcEnable="video"/></asset-clip></asset-clip>"#,
+            TrackKind::Video,
+        ),
+        (
+            r#"<asset-clip ref="a1" offset="0s" duration="5s"><asset-clip ref="a1" lane="-2147483648" offset="0s" duration="1s" srcEnable="audio"/></asset-clip>"#,
+            TrackKind::Audio,
+        ),
+        (
+            r#"<asset-clip ref="a1" offset="0s" duration="5s"><asset-clip ref="a1" lane="2000000000" offset="0s" duration="1s" srcEnable="video"/></asset-clip>"#,
+            TrackKind::Video,
+        ),
+    ] {
+        let (imp, rep) = import_on_small_stack(fcpxml_doc(asset, spine));
+        assert!(rep.mentions("lane"), "{spine}: {rep:?}");
+        let tracks = imp.project.sequence(only_seq(&imp)).unwrap().tracks(kind);
+        assert!(tracks.len() <= 999, "{spine}: {} tracks", tracks.len());
+        assert!(tracks.last().is_some_and(|t| t.items.len() == 1), "{spine}: the clip lands on the top track");
+    }
+}
