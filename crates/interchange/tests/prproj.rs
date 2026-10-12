@@ -306,7 +306,8 @@ fn sample() -> String {
                 items("Params", "Param", &["256"])
             ),
         ),
-        param("AudioComponentParam", "256", 0, "Balance", "0.75", None),
+        // pan automation: the start value is kept, the envelope reported
+        param("AudioComponentParam", "256", 0, "Balance", "0.75", Some(&format!("0,0.75,0,0,0,0.3333,0,0.3333;{S},0.25,0,0,0,0.3333,0,0.3333"))),
         // V1: an edit with Motion (position, scale, rotation keyframes, crop) and other effects
         track_item("VideoClipTrackItem", "100", 0, 4 * S, "300", Some("200"), &r("TailTransition", "120")),
         sub_clip("300", "301", "d0000000-0000-0000-0000-000000000001", "Interview"),
@@ -594,9 +595,11 @@ fn self_nesting_sequences_are_cut() {
         seq("f0000000-0000-0000-0000-00000000000b", "B", "51"),
         group("VideoTrackGroup", "50", &["f1000000-0000-0000-0000-00000000000a"], FPS25, "<FrameRect>0,0,1920,1080</FrameRect>"),
         group("VideoTrackGroup", "51", &["f1000000-0000-0000-0000-00000000000b"], FPS25, "<FrameRect>0,0,1920,1080</FrameRect>"),
-        track("VideoClipTrack", "f1000000-0000-0000-0000-00000000000a", None, "", &["100"], &[]),
+        // the clip that gets cut has a fade out
+        track("VideoClipTrack", "f1000000-0000-0000-0000-00000000000a", None, "", &["100"], &["120"]),
+        transition("VideoTransitionTrackItem", "120", S / 2, S, S / 2, true, false, "Cross Dissolve"),
         track("VideoClipTrack", "f1000000-0000-0000-0000-00000000000b", None, "", &["101"], &[]),
-        track_item("VideoClipTrackItem", "100", 0, S, "300", None, ""),
+        track_item("VideoClipTrackItem", "100", 0, S, "300", None, &r("TailTransition", "120")),
         sub_clip("300", "33", "d0000000-0000-0000-0000-00000000000b", "B"),
         track_item("VideoClipTrackItem", "101", 0, S, "301", None, ""),
         sub_clip("301", "31", "d0000000-0000-0000-0000-00000000000a", "A"),
@@ -606,6 +609,53 @@ fn self_nesting_sequences_are_cut() {
     let p = &r.imported.project;
     let total: usize = p.sequences().filter_map(|i| i.as_sequence()).map(|s| s.all_tracks().map(|t| t.items.len()).sum::<usize>()).sum();
     assert_eq!(total, 1, "one of the two nestings is cut");
+    // no transition is left pointing at a removed clip (the fade lost its only clip: gone)
+    for t in p.sequences().filter_map(|i| i.as_sequence()).flat_map(|s| s.all_tracks()) {
+        for tr in &t.transitions {
+            assert!(tr.from.is_some() || tr.to.is_some());
+            for c in [tr.from, tr.to].into_iter().flatten() {
+                assert!(t.items.iter().any(|i| i.id == c), "transition points at a removed clip");
+            }
+        }
+    }
+    let transitions: usize = p.sequences().filter_map(|i| i.as_sequence()).flat_map(|s| s.all_tracks()).map(|t| t.transitions.len()).sum();
+    assert_eq!(transitions, 0);
+}
+
+#[test]
+fn invalid_utf8_is_refused() {
+    let mut bytes = sample().into_bytes();
+    let at = bytes.len() / 2;
+    bytes[at] = 0xff;
+    for b in [bytes.clone(), gzip(&bytes)] {
+        let e = prproj::import(&b, &opts()).unwrap_err().to_string();
+        assert!(e.contains("UTF-8"), "{e}");
+    }
+}
+
+#[test]
+fn far_away_points_and_endless_keyframes_are_bounded() {
+    // a finite fraction that overflows once scaled to pixels: the position is not imported
+    let xml = sample().replace("0.25:0.75", "1e308:0.75");
+    let r = prproj::import(xml.as_bytes(), &opts()).unwrap();
+    let seq = r.imported.project.sequences().find_map(|i| i.as_sequence()).unwrap();
+    let c0 = &seq.video_tracks[0].items[0];
+    match c0.effect("motion").and_then(|e| e.param("position")).map(|p| &p.value) {
+        Some(ParamValue::Vec2(v)) => assert!(!(v.x.is_infinite() || v.y.is_infinite()), "{v:?}"),
+        other => panic!("{other:?}"),
+    }
+    // a scale far beyond our range is clamped to it
+    let xml = sample().replace(&format!("{NO_TIME},150.,"), &format!("{NO_TIME},1e300,"));
+    let r = prproj::import(xml.as_bytes(), &opts()).unwrap();
+    let seq = r.imported.project.sequences().find_map(|i| i.as_sequence()).unwrap();
+    assert_eq!(float(&seq.video_tracks[0].items[0], "motion", "scale"), 10_000.0);
+    // more keyframes than the cap: the first ones come in and the report says so
+    let keys: String = (0..100_001).map(|i| format!("{},50.,0,0,0,0.3333,0,0.3333;", 3600 * S + i)).collect();
+    let xml = sample().replace(&format!("{},0.,0,0,0,0.1666,0,0.1666;{},100.,0,0,0,0.1666,0,0.1666", 3600 * S, 3601 * S), &keys);
+    let r = prproj::import(xml.as_bytes(), &opts()).unwrap();
+    assert!(r.report.mentions("more than 100000 keyframes"), "{}", r.report);
+    // track pan automation is reported (the sample's A1 pans over time)
+    assert!(r.report.mentions("pan automation"));
 }
 
 #[test]

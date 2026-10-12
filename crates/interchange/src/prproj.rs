@@ -371,6 +371,8 @@ struct PParam<'a> {
     name: &'a str,
     value: Option<&'a str>,
     keys: Vec<Key<'a>>,
+    /// More than [`MAX_KEYFRAMES`] keyframes: the rest were dropped.
+    truncated: bool,
 }
 
 fn interpolation(kind: &str, sub: &str) -> Interpolation {
@@ -387,9 +389,11 @@ fn influence(s: Option<&str>) -> f64 {
     s.and_then(num).filter(|v| *v > 0.0 && *v <= 1.0).unwrap_or(1.0 / 3.0)
 }
 
-fn parse_keys(text: &str) -> Vec<Key<'_>> {
+/// The keyframes of a `Keyframes` value, at most [`MAX_KEYFRAMES`]; `true` when more were there.
+fn parse_keys(text: &str) -> (Vec<Key<'_>>, bool) {
     let mut out = Vec::new();
-    for k in text.split(';').filter(|k| !k.trim().is_empty()).take(MAX_KEYFRAMES) {
+    let mut entries = text.split(';').filter(|k| !k.trim().is_empty());
+    for k in entries.by_ref().take(MAX_KEYFRAMES) {
         let f: Vec<&str> = k.split(',').collect();
         let (Some(t), Some(raw)) = (f.first().and_then(|t| t.trim().parse::<i64>().ok()), f.get(1)) else { continue };
         if !(Tick::MIN.0..=Tick::MAX.0).contains(&t) {
@@ -403,16 +407,17 @@ fn parse_keys(text: &str) -> Vec<Key<'_>> {
             out_influence: influence(f.get(7).copied()),
         });
     }
-    out
+    let truncated = entries.next().is_some();
+    (out, truncated)
 }
 
 fn parse_param<'a>(p: Node<'a, '_>) -> PParam<'a> {
     let value = child_text(p, "StartKeyframe").and_then(|s| s.split(',').nth(1)).or_else(|| child_text(p, "CurrentValue"));
-    let keys = match (child_bool(p, "IsTimeVarying"), child_text(p, "Keyframes")) {
-        (Some(false), _) | (_, None) => Vec::new(),
+    let (keys, truncated) = match (child_bool(p, "IsTimeVarying"), child_text(p, "Keyframes")) {
+        (Some(false), _) | (_, None) => (Vec::new(), false),
         (_, Some(k)) => parse_keys(k),
     };
-    PParam { pid: child_text(p, "ParameterID").and_then(|s| s.parse().ok()), name: child_text(p, "Name").unwrap_or(""), value, keys }
+    PParam { pid: child_text(p, "ParameterID").and_then(|s| s.parse().ok()), name: child_text(p, "Name").unwrap_or(""), value, keys, truncated }
 }
 
 /// A FilmCraft parameter from a Premiere one. `conv` turns a value into ours; keyframe times move
@@ -434,6 +439,27 @@ fn to_param(p: &PParam, offset: i64, conv: impl Fn(&str) -> Option<ParamValue>) 
         out.value = k.value.clone();
     }
     Some(out)
+}
+
+/// Farthest a Motion point may be from the frame origin, in pixels (frames are at most 32 768
+/// wide; a point farther out is damage, not an edit).
+const MAX_POINT_PX: f64 = 1e7;
+
+/// A point in pixels, if it is finite and within [`MAX_POINT_PX`]: a huge fraction from the file
+/// times the frame size could otherwise overflow to infinity and poison the transform maths.
+fn pixels(x: f64, y: f64) -> Option<ParamValue> {
+    let ok = |v: f64| v.is_finite() && v.abs() <= MAX_POINT_PX;
+    (ok(x) && ok(y)).then(|| ParamValue::Vec2(Vec2::new(x, y)))
+}
+
+/// A number clamped to the range our `effect`'s `param` takes (any finite number when it has no
+/// range, e.g. an angle).
+fn float_in(effect: &str, param: &str) -> impl Fn(&str) -> Option<ParamValue> {
+    let (lo, hi) = match find_effect(effect).and_then(|d| d.param(param)).map(|p| &p.kind) {
+        Some(ParamKind::Float { min, max, .. }) => (*min, *max),
+        _ => (-MAX_POINT_PX, MAX_POINT_PX),
+    };
+    move |s: &str| num(s).map(|v| ParamValue::Float(v.clamp(lo, hi)))
 }
 
 fn is_centre(p: &PParam) -> bool {
@@ -624,10 +650,10 @@ pub fn import(bytes: &[u8], opts: &ImportOptions) -> Result<PrprojImport> {
     } else {
         return Err(parse_err("not a Premiere Pro project"));
     };
-    let text = match String::from_utf8(xml) {
-        Ok(s) => s,
-        Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
-    };
+    // Premiere writes UTF-8. Invalid bytes mean a damaged file: refuse it rather than copying
+    // a possibly huge document into a lossy (up to three times larger) one.
+    let text = String::from_utf8(xml)
+        .map_err(|e| parse_err(format!("the project is not valid UTF-8 text at byte {} (the file is damaged)", e.utf8_error().valid_up_to())))?;
     let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
     if nesting_depth(text.as_bytes(), MAX_XML_DEPTH) > MAX_XML_DEPTH {
         return Err(parse_err(format!("elements are nested more than {MAX_XML_DEPTH} deep (the file is damaged)")));
@@ -1148,10 +1174,14 @@ impl<'a, 'i> Imp<'a, 'i> {
         }
         if let Some(pan) = self.g.follow(audio, &["Panner"]) {
             for p in self.params(at(pan, &["PanProcessor", "AudioComponent", "Component"])) {
-                if p.name == "Balance"
-                    && let Some(v) = p.value.and_then(num)
-                {
+                if p.name != "Balance" {
+                    continue;
+                }
+                if let Some(v) = p.value.and_then(num) {
                     t.pan = ((v - 0.5) * 200.0).clamp(-100.0, 100.0);
+                }
+                if !p.keys.is_empty() {
+                    self.report.warn("audio track pan automation was not imported (the pan at its start was)");
                 }
             }
         }
@@ -1399,8 +1429,13 @@ impl<'a, 'i> Imp<'a, 'i> {
 
     // ---- effects ----
 
-    fn params(&self, core: Option<Node<'a, 'i>>) -> Vec<PParam<'a>> {
-        self.g.list(core.and_then(|c| child(c, "Params")), "Param").into_iter().map(parse_param).collect()
+    fn params(&mut self, core: Option<Node<'a, 'i>>) -> Vec<PParam<'a>> {
+        let params: Vec<PParam<'a>> = self.g.list(core.and_then(|c| child(c, "Params")), "Param").into_iter().map(parse_param).collect();
+        for p in params.iter().filter(|p| p.truncated) {
+            let name = if p.name.is_empty() { "a parameter" } else { p.name };
+            self.report.warn(format!("\"{name}\" has more than {MAX_KEYFRAMES} keyframes; only the first {MAX_KEYFRAMES} were imported"));
+        }
+        params
     }
 
     fn components(&self, chain: Node<'a, 'i>) -> Vec<Node<'a, 'i>> {
@@ -1439,27 +1474,24 @@ impl<'a, 'i> Imp<'a, 'i> {
     }
 
     fn motion(&mut self, t: &mut TrackItem, params: &[PParam], enabled: bool, frame: (f64, f64), src: (f64, f64), offset: i64) {
-        let f = |s: &str| num(s).map(ParamValue::Float);
         let mut crop: Vec<(&str, &PParam)> = Vec::new();
         for p in params {
             match p.pid {
                 Some(1) if !is_centre(p) => {
-                    let conv = |s: &str| point(s).map(|(x, y)| ParamValue::Vec2(Vec2::new(x * frame.0, y * frame.1)));
-                    if let Some(v) = to_param(p, offset, conv) {
+                    if let Some(v) = to_param(p, offset, |s| point(s).and_then(|(x, y)| pixels(x * frame.0, y * frame.1))) {
                         set_param(t, "motion", "position", v);
                     }
                 }
-                Some(2) => self.put(t, "motion", "scale", to_param(p, offset, f)),
-                Some(3) => self.put(t, "motion", "scale_width", to_param(p, offset, f)),
+                Some(2) => self.put(t, "motion", "scale", to_param(p, offset, float_in("motion", "scale"))),
+                Some(3) => self.put(t, "motion", "scale_width", to_param(p, offset, float_in("motion", "scale_width"))),
                 Some(4) => self.put(t, "motion", "uniform_scale", to_param(p, offset, |s| boolean(s).map(ParamValue::Bool))),
-                Some(5) => self.put(t, "motion", "rotation", to_param(p, offset, f)),
+                Some(5) => self.put(t, "motion", "rotation", to_param(p, offset, float_in("motion", "rotation"))),
                 Some(6) if !is_centre(p) => {
-                    let conv = |s: &str| point(s).map(|(x, y)| ParamValue::Vec2(Vec2::new(x * src.0, y * src.1)));
-                    if let Some(v) = to_param(p, offset, conv) {
+                    if let Some(v) = to_param(p, offset, |s| point(s).and_then(|(x, y)| pixels(x * src.0, y * src.1))) {
                         set_param(t, "motion", "anchor", v);
                     }
                 }
-                Some(7) => self.put(t, "motion", "anti_flicker", to_param(p, offset, f)),
+                Some(7) => self.put(t, "motion", "anti_flicker", to_param(p, offset, float_in("motion", "anti_flicker"))),
                 Some(8) => crop.push(("left", p)),
                 Some(9) => crop.push(("top", p)),
                 Some(10) => crop.push(("right", p)),
@@ -1613,6 +1645,14 @@ impl<'a, 'i> Imp<'a, 'i> {
             if let Some(s) = self.b.p.sequence_mut(a) {
                 for t in s.all_tracks_mut() {
                     t.items.retain(|c| !bad.contains(&c.item));
+                    // a transition keeps the side whose clip is still there (a dissolve becomes a
+                    // fade); one with neither side goes
+                    let left: HashSet<ClipId> = t.items.iter().map(|c| c.id).collect();
+                    for tr in &mut t.transitions {
+                        tr.from = tr.from.filter(|c| left.contains(c));
+                        tr.to = tr.to.filter(|c| left.contains(c));
+                    }
+                    t.transitions.retain(|tr| tr.from.is_some() || tr.to.is_some());
                 }
             }
             self.report.warn("clips that nested a sequence inside itself were removed");
@@ -1734,13 +1774,18 @@ mod tests {
 
     #[test]
     fn keyframes() {
-        let k = parse_keys("4819827589,0.,0,0,0,0.16666666666666666,252.57,0.16666666666666666;105392315449,100.,5,4,252.5,0.5,0,0.5;bad;;");
+        let (k, truncated) = parse_keys("4819827589,0.,0,0,0,0.16666666666666666,252.57,0.16666666666666666;105392315449,100.,5,4,252.5,0.5,0,0.5;bad;;");
+        assert!(!truncated);
+        let many = "0,1.;".repeat(MAX_KEYFRAMES + 1);
+        let (all, cut) = parse_keys(&many);
+        assert_eq!((all.len(), cut), (MAX_KEYFRAMES, true));
+        assert!(!parse_keys(&"0,1.;".repeat(MAX_KEYFRAMES)).1, "exactly the limit is complete");
         assert_eq!(k.len(), 2);
         assert_eq!(k[0].time, 4_819_827_589);
         assert_eq!(k[0].interp, Interpolation::Linear);
         assert_eq!(k[1].interp, Interpolation::AutoBezier);
         assert!((k[1].in_influence - 0.5).abs() < 1e-12);
-        let p = PParam { pid: Some(1), name: "Opacity", value: Some("100."), keys: k };
+        let p = PParam { pid: Some(1), name: "Opacity", value: Some("100."), keys: k, truncated };
         let param = to_param(&p, 1_000, |s| num(s).map(ParamValue::Float)).unwrap();
         assert_eq!(param.keyframes.len(), 2);
         assert_eq!(param.keyframes[0].time, Tick(4_819_826_589));
