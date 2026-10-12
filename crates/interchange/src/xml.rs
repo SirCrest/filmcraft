@@ -1,5 +1,6 @@
 //! Minimal XML writer and read helpers over `roxmltree`.
 
+use std::collections::HashMap;
 use std::fmt::Write as _;
 
 use roxmltree::Node;
@@ -152,14 +153,15 @@ pub const MAX_XML_DEPTH: usize = 128;
 /// Entity expansions the XML parser nests inside one another (roxmltree's documented limit).
 const ENTITY_NESTING: usize = 10;
 
+/// Nesting each entity reference expands to, by entity name.
+type Expansions<'a> = HashMap<&'a [u8], usize>;
+
 /// An upper bound on the element nesting the XML parser reaches in `xml`; counting stops once it
 /// passes `limit`. Exact for the well-formed prefix of a document, which is all the parser gets
 /// through: quotes, comments, CDATA, processing instructions and the DOCTYPE are skipped like the
-/// parser does. Elements inside internal-subset entities count once per expansion the parser nests.
+/// parser does, and entity references in text count the nesting their expansions reach.
 pub(crate) fn nesting_depth(xml: &[u8], limit: usize) -> usize {
-    let mut entities = 0;
-    let depth = content_depth(xml, limit, Some(&mut entities));
-    depth.saturating_add(entities.saturating_mul(ENTITY_NESTING))
+    content_depth(xml, limit, None)
 }
 
 /// Index just past the first `pat` at or after `from`.
@@ -167,9 +169,14 @@ fn find(xml: &[u8], from: usize, pat: &[u8]) -> Option<usize> {
     xml.get(from..)?.windows(pat.len()).position(|w| w == pat).map(|p| from + p + pat.len())
 }
 
+/// Length of the XML name `s` starts with (any non-ASCII byte counts: a superset of the parser's).
+fn name_len(s: &[u8]) -> usize {
+    s.iter().take_while(|&&c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b':' | b'-' | b'.') || c >= 0x80).count()
+}
+
 /// Index just past the first of `stops` at or after `from` outside a quoted literal, and that byte.
 /// `literal` sees each literal's contents.
-fn skip_quoted(xml: &[u8], from: usize, stops: &[u8], mut literal: impl FnMut(&[u8])) -> Option<(usize, u8)> {
+fn skip_quoted<'a>(xml: &'a [u8], from: usize, stops: &[u8], mut literal: impl FnMut(&'a [u8])) -> Option<(usize, u8)> {
     let mut i = from;
     loop {
         let c = *xml.get(i)?;
@@ -184,12 +191,39 @@ fn skip_quoted(xml: &[u8], from: usize, stops: &[u8], mut literal: impl FnMut(&[
     }
 }
 
+/// The deepest nesting the entity references (`&name;`) in `text`, at `depth`, expand to.
+fn references(text: &[u8], depth: usize, expansions: &Expansions) -> usize {
+    let mut max = 0;
+    let mut rest = text;
+    while let Some(at) = rest.iter().position(|&c| c == b'&') {
+        rest = rest.get(at + 1..).unwrap_or_default();
+        let n = name_len(rest);
+        if rest.get(n) == Some(&b';')
+            && let Some(&e) = rest.get(..n).and_then(|name| expansions.get(name))
+        {
+            max = max.max(depth.saturating_add(e));
+        }
+        rest = rest.get(n..).unwrap_or_default();
+    }
+    max
+}
+
 /// The deepest element nesting in `xml` read as element content, counting stops once it passes
-/// `limit`. With `entities`, a DOCTYPE is read like the parser does and the deepest nesting in its
-/// entity values is recorded there.
-fn content_depth(xml: &[u8], limit: usize, mut entities: Option<&mut usize>) -> usize {
+/// `limit`. `entities` are the expansions of the entities of the document `xml` is an entity value
+/// of; for the document itself (`None`), its DOCTYPE is read like the parser does.
+fn content_depth<'a>(xml: &'a [u8], limit: usize, entities: Option<&Expansions<'a>>) -> usize {
+    let mut declared = Expansions::new();
     let (mut depth, mut max, mut i) = (0usize, 0usize, 0usize);
-    while let Some(at) = xml.get(i..).and_then(|s| s.iter().position(|&c| c == b'<')).map(|p| i + p) {
+    loop {
+        let next = xml.get(i..).and_then(|s| s.iter().position(|&c| c == b'<')).map(|p| i + p);
+        // text up to the next markup, where entity references expand
+        if let Some(text) = xml.get(i..next.unwrap_or(xml.len())) {
+            max = max.max(references(text, depth, entities.unwrap_or(&declared)));
+            if max > limit {
+                return max;
+            }
+        }
+        let Some(at) = next else { break };
         let rest = xml.get(at..).unwrap_or_default();
         i = match rest.get(1) {
             None => break,
@@ -200,13 +234,14 @@ fn content_depth(xml: &[u8], limit: usize, mut entities: Option<&mut usize>) -> 
             Some(b'?') => find(xml, at + 2, b"?>").unwrap_or(xml.len()),
             Some(b'!') if rest.starts_with(b"<!--") => find(xml, at + 4, b"-->").unwrap_or(xml.len()),
             Some(b'!') if rest.starts_with(b"<![CDATA[") => find(xml, at + 9, b"]]>").unwrap_or(xml.len()),
-            Some(b'!') => match entities.as_deref_mut() {
-                Some(e) if rest.starts_with(b"<!DOCTYPE") => match doctype(xml, at + 9, limit, e) {
-                    Some(end) => end,
-                    None => break,
-                },
-                _ => find(xml, at + 2, b">").unwrap_or(xml.len()),
+            Some(b'!') if entities.is_none() && rest.starts_with(b"<!DOCTYPE") => match doctype(xml, at + 9, limit) {
+                Some((end, expansions)) => {
+                    declared = expansions;
+                    end
+                }
+                None => break,
             },
+            Some(b'!') => find(xml, at + 2, b">").unwrap_or(xml.len()),
             Some(_) => {
                 // a start tag, to its '>' outside quoted attribute values
                 let (mut j, mut quote, mut self_closing) = (at + 1, None, false);
@@ -238,19 +273,39 @@ fn content_depth(xml: &[u8], limit: usize, mut entities: Option<&mut usize>) -> 
 }
 
 /// Skips a DOCTYPE from just after `<!DOCTYPE` as the parser reads it (its external ID's literals
-/// may hold `>` or `<!--`), recording in `entities` the deepest nesting in an entity value of its
-/// internal subset. Returns where the document continues, or `None` where the parser fails.
-fn doctype(xml: &[u8], from: usize, limit: usize, entities: &mut usize) -> Option<usize> {
+/// may hold `>` or `<!--`). Returns where the document continues and the nesting a reference to
+/// each internal-subset entity expands to, or `None` where the parser fails.
+fn doctype(xml: &[u8], from: usize, limit: usize) -> Option<(usize, Expansions<'_>)> {
     let (mut i, end) = skip_quoted(xml, from, b"[>", |_| {})?;
     if end == b'>' {
-        return Some(i);
+        return Some((i, Expansions::new()));
     }
     let space = |i: usize| xml.get(i..).map_or(0, |s| s.iter().take_while(|c| matches!(c, b' ' | b'\t' | b'\n' | b'\r')).count());
+    // (name, value) of each entity with a literal value (the parser loads no external ones)
+    let mut entities = Vec::new();
     loop {
         i += space(i);
         let rest = xml.get(i..)?;
         i = if rest.starts_with(b"<!ENTITY") {
-            skip_quoted(xml, i + 8, b">", |value| *entities = (*entities).max(content_depth(value, limit, None)))?.0
+            // '<!ENTITY' S ('%' S)? Name S (EntityValue | ExternalID) S? '>'
+            let mut j = i + 8;
+            j += space(j);
+            if xml.get(j) == Some(&b'%') {
+                j += 1 + space(j + 1);
+            }
+            let name = xml.get(j..j + name_len(xml.get(j..)?))?;
+            j += name.len();
+            j += space(j);
+            let quoted = matches!(xml.get(j), Some(b'"' | b'\''));
+            let mut value = None;
+            let end = skip_quoted(xml, j, b">", |lit| {
+                value.get_or_insert(lit);
+            })?
+            .0;
+            if let (true, Some(value)) = (quoted, value) {
+                entities.push((name, value));
+            }
+            end
         } else if rest.starts_with(b"<!--") {
             find(xml, i + 4, b"-->")?
         } else if rest.starts_with(b"<?") {
@@ -260,11 +315,31 @@ fn doctype(xml: &[u8], from: usize, limit: usize, entities: &mut usize) -> Optio
             find(xml, i + 2, b">")?
         } else if rest.starts_with(b"]") {
             let j = i + 1 + space(i + 1);
-            return (xml.get(j) == Some(&b'>')).then_some(j + 1);
+            return (xml.get(j) == Some(&b'>')).then(|| (j + 1, expansions(&entities, limit)));
         } else {
             return None;
         };
     }
+}
+
+/// The nesting a reference to each entity expands to: its value's own, and through the entities it
+/// references in turn, as deep as the parser nests expansions.
+fn expansions<'a>(entities: &[(&'a [u8], &'a [u8])], limit: usize) -> Expansions<'a> {
+    // after round k, each entity's nesting with k - 1 further expansions inside it
+    let mut inner = Expansions::new();
+    for _ in 0..ENTITY_NESTING {
+        let mut next = Expansions::new();
+        for &(name, value) in entities {
+            let d = content_depth(value, limit, Some(&inner));
+            let e = next.entry(name).or_insert(0);
+            *e = (*e).max(d);
+        }
+        if next == inner {
+            break;
+        }
+        inner = next;
+    }
+    inner
 }
 
 /// The deepest element nesting in a parsed document, without recursion.
@@ -341,19 +416,31 @@ mod tests {
             "<!DOCTYPE x SYSTEM \"><!--\"><x><y/></x>",
             "<!DOCTYPE x PUBLIC '[' \"]>\" [<!ELEMENT x (#PCDATA)><!-- ]> --><?pi ]>?>]  ><x><y></y></x>",
             "<!DOCTYPE x [<!ENTITY e 'text'>]><x>&e;</x>",
+            // entity references count the nesting their expansions reach, through other entities
+            "<!DOCTYPE x [<!ENTITY e '<a><b/></a>'>]><x>&e;</x>",
+            "<!DOCTYPE x [<!ENTITY a '<a/>'><!ENTITY b \"<b>&a;</b>\">]><x>&b;<y>&a;</y></x>",
+            // ... but not in CDATA, comments or attribute values
+            "<!DOCTYPE x [<!ENTITY e '<a/>'>]><x t='&amp;'><![CDATA[&e;]]><!-- &e; --></x>",
         ] {
             assert_eq!(d(s), parsed(s), "{s}");
+        }
+        // an entity that is never referenced never expands; one referenced once, once
+        let deep = format!("{}{}", "<a>".repeat(13), "</a>".repeat(13));
+        for (body, depth) in [("<x/>", 1), ("<x>&u;</x>", 14)] {
+            let s = format!("<!DOCTYPE x [<!ENTITY u '{deep}'>]>{body}");
+            assert_eq!((d(&s), parsed(&s)), (depth, depth), "{s}");
         }
         assert_eq!(d(&format!("{}{}", "<a>".repeat(50), "</a>".repeat(50))), 50);
         assert_eq!(nesting_depth("<a>".repeat(10_000).as_bytes(), 128), 129, "stops counting past the limit");
         // unterminated constructs end the scan (an unfinished tag counts: over, never under)
         assert_eq!(d("<a><!-- open"), 1);
         assert_eq!(d("<a b=\"unclosed><c><d>"), 1);
-        // elements in entity values count once per expansion the parser can nest
-        let s = "<!DOCTYPE x [<!ENTITY e '<a><b/></a>'>]><x>&e;</x>";
-        assert_eq!((parsed(s), d(s)), (3, 1 + ENTITY_NESTING * 2));
+        // an entity referencing itself expands as deep as the parser nests expansions, then fails
+        let s = "<!DOCTYPE x [<!ENTITY e '<a>&e;</a>'>]><x>&e;</x>";
+        assert_eq!(d(s), 1 + ENTITY_NESTING);
+        assert!(parse(s).is_err());
         // ELEMENT, ATTLIST and NOTATION end at their first '>': a quote there hides no entity
-        assert_eq!(d("<!DOCTYPE x [<!ELEMENT x '> <!ENTITY e \"<a><b>\"> <!ATTLIST x '>]><x/>"), 1 + ENTITY_NESTING * 2);
+        assert_eq!(d("<!DOCTYPE x [<!ELEMENT x '> <!ENTITY e \"<a><b>\"> <!ATTLIST x '>]><x>&e;</x>"), 3);
         // the parser stops at an unknown DTD token, and so does the scan
         assert_eq!(d("<!DOCTYPE x [<!BOGUS> ]><x><y><z/></y></x>"), 0);
         assert!(parse("<!DOCTYPE x [<!BOGUS> ]><x><y><z/></y></x>").is_err());

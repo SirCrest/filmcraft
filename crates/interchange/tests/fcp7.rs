@@ -629,3 +629,12 @@ fn deeply_nested_xml_does_not_overflow_the_stack() {
     }
     assert_eq!(bin_depth(&imp.project.root), bins);
 }
+
+/// Entities a document declares but never references never expand, so they do not count toward
+/// the depth limit.
+#[test]
+fn unreferenced_entities_do_not_count_toward_the_depth_limit() {
+    let doc = premiere_style_doc().replace("<!DOCTYPE xmeml>", &format!("<!DOCTYPE xmeml [<!ENTITY unused '{}'>]>", nest("a", 13)));
+    assert!(doc.contains("<!ENTITY unused"));
+    assert!(import(doc.as_bytes(), Format::Fcp7Xml, None).is_ok());
+}
