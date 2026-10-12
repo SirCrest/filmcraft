@@ -11,7 +11,7 @@ FilmCraft from an agent. Part 2 covers developing FilmCraft as an agent.
 
 | Mode | Command | What it drives |
 |---|---|---|
-| Headless | `filmcraft-cli mcp --demo` or `--project p.fcproj` (neither = empty project) | an in-process engine session, no window |
+| Headless | `filmcraft-cli mcp --demo` or `--project p.fcproj` (or a Premiere Pro `p.prproj`; neither = empty project) | an in-process engine session, no window |
 | Bridge | `filmcraft-cli mcp --bridge 127.0.0.1:9876` | the running desktop app started with `filmcraft --control 9876` |
 
 Headless mode also takes `--data-dir DIR` (user presets). Any other option is rejected (exit 2):
@@ -209,6 +209,7 @@ filmcraft-cli export --list-presets prores       # built-in + user presets (--da
 filmcraft-cli --project p.fcproj exec export.queue.add preset="Apple ProRes 422 HQ" path=renders/ start=true wait=true
 echo '{"id":"file.newBin","params":{"name":"Selects"}}' | filmcraft-cli --project p.fcproj --save run -
 filmcraft-cli --bridge 127.0.0.1:9876 exec window.workspace.color   # the running app
+filmcraft-cli --project cut.prproj --save inspect project   # a Premiere Pro project; --save writes cut.fcproj beside it
 ```
 
 `key=value` values are parsed as JSON when they can be (`3.5`, `true`, `[1,2]`), otherwise taken as

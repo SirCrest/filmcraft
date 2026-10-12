@@ -1710,12 +1710,19 @@ impl Session {
 
     /// Note a project file as the most recent one (General ▸ At Startup ▸ Open Most Recent).
     pub fn note_recent_project(&mut self) {
-        let Some(p) = self.path.clone() else { return };
-        if self.prefs.general.recent_projects.first() == Some(&p) {
+        if let Some(p) = self.path.clone() {
+            self.note_recent_file(&p);
+        }
+    }
+
+    /// Note `path` as the most recent project, also when it is not the session's own file (a
+    /// Premiere Pro project that was opened: reopening it reads it again).
+    pub fn note_recent_file(&mut self, path: &str) {
+        if self.prefs.general.recent_projects.first().is_some_and(|p| p == path) {
             return;
         }
         let mut next = self.prefs.clone();
-        next.note_recent(&p);
+        next.note_recent(path);
         let _ = self.set_prefs(next);
     }
 }

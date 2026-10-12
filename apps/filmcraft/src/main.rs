@@ -1,7 +1,7 @@
 //! FilmCraft desktop app.
 //!
 //! Usage: `filmcraft [--control <port>] [--demo|--empty] [--recover|--no-recover] [--data-dir <dir>]
-//! [project.fcproj | media files…]`; `--help` prints the options, `--version` the version. An
+//! [project.fcproj | project.prproj | media files…]`; `--help` prints the options, `--version` the version. An
 //! unknown option is an error (exit code 2), not a file to open.
 //!
 //! Without a project, `--demo` or `--empty`, Settings ▸ General ▸ At Startup decides: Show Home
@@ -214,8 +214,9 @@ fn app_creator(launch: Launch, graphics: graphics::GraphicsStart, created: Arc<A
         }
         // voice-over recording reads the microphone through cpal
         session.voiceover.input = Some(Box::new(audio_in::CpalIn::new(&session.prefs.audio_hardware.device_class)));
-        let project = files.iter().find(|f| f.ends_with(".fcproj")).cloned();
-        if let Some(p) = project {
+        // a FilmCraft or Premiere Pro project opens; other files are imported into it
+        let project = files.iter().find(|f| filmcraft_ui_egui::project_file_kind(f).is_some()).cloned();
+        if let Some(p) = &project {
             if let Err(e) = session.execute("file.open", json!({"path": p})) {
                 log::error!("{e}");
             }
@@ -236,7 +237,9 @@ fn app_creator(launch: Launch, graphics: graphics::GraphicsStart, created: Arc<A
         } else if demo {
             let _ = session.execute("file.openDemoProject", json!({}));
         }
-        let media: Vec<String> = files.iter().filter(|f| !f.ends_with(".fcproj")).cloned().collect();
+        // (a further Premiere project is imported into the open one, as File ▸ Import does)
+        let media: Vec<String> =
+            files.iter().filter(|f| project.as_deref() != Some(f.as_str()) && filmcraft_ui_egui::project_file_kind(f) != Some("fcproj")).cloned().collect();
         if !media.is_empty() {
             let _ = session.execute("file.import", json!({"paths": media}));
         }
@@ -317,7 +320,9 @@ fn app_creator(launch: Launch, graphics: graphics::GraphicsStart, created: Arc<A
         }));
         app.hooks.pick_open_project = Some(Box::new(|| {
             rfd::FileDialog::new()
+                .add_filter(filmcraft_ui_egui::i18n::t("Projects"), &file_filters::extensions(&["fcproj", "prproj"]))
                 .add_filter(filmcraft_ui_egui::i18n::t("FilmCraft Project"), &file_filters::extensions(&["fcproj"]))
+                .add_filter(filmcraft_ui_egui::i18n::t("Premiere Pro Project"), &file_filters::extensions(&["prproj"]))
                 .pick_file()
                 .map(|p| p.to_string_lossy().to_string())
         }));
