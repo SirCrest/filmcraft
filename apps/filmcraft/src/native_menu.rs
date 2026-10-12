@@ -4,7 +4,7 @@
 use std::sync::mpsc::{Receiver, channel};
 
 use filmcraft_ui_egui::FilmcraftApp;
-use filmcraft_ui_egui::menus::{MENUS, MenuItem as Item, menu_items};
+use filmcraft_ui_egui::menus::{MENUS, MenuItem as Item, NATIVE_APP_MENU, menu_items};
 use muda::accelerator::Accelerator;
 use muda::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 
@@ -28,25 +28,39 @@ pub fn install(app: &FilmcraftApp, ctx: egui::Context) -> (Receiver<String>, Sho
     let mut titles: Vec<(String, Submenu)> = Vec::new();
     let bar = Menu::new();
     let app_menu = Submenu::new("FilmCraft", true);
+    let [settings_label, hide_label, hide_others_label, quit_label] = NATIVE_APP_MENU;
     // FilmCraft ▸ Settings ▸ <category> (Premiere's app-menu layout; General is Cmd+,)
-    let settings = Submenu::new(app.ui.language.tr("Settings"), true);
-    titles.push(("Settings".into(), settings.clone()));
+    let settings = Submenu::new(app.ui.language.tr(settings_label), true);
+    titles.push((settings_label.into(), settings.clone()));
     for it in items.iter().filter(|i| i.id.starts_with("app.settings.")) {
         let label = it.label.trim_end_matches('…').to_string();
         let mi = MenuItem::with_id(it.id.clone(), label, true, it.shortcut.as_deref().and_then(accel));
         native.push((it.id.clone(), mi.clone()));
         let _ = settings.append(&mi);
     }
+    // About and Discord repeat Help menu commands: same translated labels, updated with them
+    let label = |id: &str, english: &str| items.iter().find(|i| i.id == id).map_or_else(|| english.to_string(), |i| i.label.clone());
+    let about = MenuItem::with_id("app.about", label("app.about", "About FilmCraft"), true, None);
+    let discord = MenuItem::with_id("help.discord", label("help.discord", "Join the ArtCraft Discord…"), true, None);
+    native.push(("app.about".into(), about.clone()));
+    native.push(("help.discord".into(), discord.clone()));
+    // the predefined items keep their native actions; our text lets them follow the language
+    let predefined = [
+        (hide_label, PredefinedMenuItem::hide(Some(app.ui.language.tr(hide_label)))),
+        (hide_others_label, PredefinedMenuItem::hide_others(Some(app.ui.language.tr(hide_others_label)))),
+        (quit_label, PredefinedMenuItem::quit(Some(app.ui.language.tr(quit_label)))),
+    ];
+    let [(_, hide), (_, hide_others), (_, quit)] = &predefined;
     let _ = app_menu.append_items(&[
-        &MenuItem::with_id("app.about", "About FilmCraft", true, None),
-        &MenuItem::with_id("help.discord", "Join the ArtCraft Discord…", true, None),
+        &about,
+        &discord,
         &PredefinedMenuItem::separator(),
         &settings,
         &PredefinedMenuItem::separator(),
-        &PredefinedMenuItem::hide(None),
-        &PredefinedMenuItem::hide_others(None),
+        hide,
+        hide_others,
         &PredefinedMenuItem::separator(),
-        &PredefinedMenuItem::quit(None),
+        quit,
     ]);
     let _ = bar.append(&app_menu);
     for top in MENUS {
@@ -103,11 +117,22 @@ pub fn install(app: &FilmcraftApp, ctx: egui::Context) -> (Receiver<String>, Sho
             filmcraft_ui_egui::i18n::Language::Uk
         } else if checked("app.language.chinese") {
             filmcraft_ui_egui::i18n::Language::ZhCn
+        } else if checked("app.language.german") {
+            filmcraft_ui_egui::i18n::Language::De
+        } else if checked("app.language.russian") {
+            filmcraft_ui_egui::i18n::Language::Ru
+        } else if checked("app.language.french") {
+            filmcraft_ui_egui::i18n::Language::Fr
+        } else if checked("app.language.indonesian") {
+            filmcraft_ui_egui::i18n::Language::Id
         } else {
             filmcraft_ui_egui::i18n::Language::En
         };
         for (title, submenu) in &titles {
             submenu.set_text(language.tr(title));
+        }
+        for (label, item) in &predefined {
+            item.set_text(language.tr(label));
         }
         for (id, mi) in &native {
             if let Some(it) = items.iter().find(|i| &i.id == id) {

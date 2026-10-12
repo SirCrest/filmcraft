@@ -9,7 +9,7 @@ use std::sync::mpsc::{Sender, channel};
 
 use egui_kittest::Harness;
 use filmcraft_engine::Session;
-use filmcraft_project::ClipId;
+use filmcraft_project::{ClipId, Interpolation, Param};
 use filmcraft_time::Tick;
 use filmcraft_ui_egui::FilmcraftApp;
 use filmcraft_ui_egui::control::ControlRequest;
@@ -105,6 +105,17 @@ impl Driver {
         let p = it.effect("motion").unwrap().param("scale").unwrap();
         (p.keyframes.iter().map(|k| k.time.0).collect(), p.f64_at(it.source_time_at(s.playhead())))
     }
+    fn parameter(&self, clip: &Clip, effect: &str, param: &str) -> Param {
+        self.harness.state().session.active_sequence().unwrap().find_item(ClipId(clip.id)).unwrap().1.effect(effect).unwrap().param(param).unwrap().clone()
+    }
+    fn undo_len(&mut self) -> usize {
+        self.exec("history.list", json!({}))["undo"].as_array().unwrap().len()
+    }
+    fn right_click(&mut self, id: &str) {
+        self.rect(id);
+        self.ok("ui.click", json!({"id": id, "button": "right"}));
+        self.frames(3);
+    }
     fn shot(&mut self, name: &str) {
         let Some(dir) = self.shots.clone() else { return };
         for _ in 0..40 {
@@ -184,6 +195,22 @@ fn properties_diamond_adds_and_removes_the_keyframe_at_the_playhead() {
     assert!(d.find(&format!("{SCALE}.prevKeyframe")).is_none());
 }
 
+/// #284: every Effect Controls property has a reset button; on an animated property it puts the
+/// default in as a keyframe at the playhead and keeps the other keyframes.
+#[test]
+fn effect_controls_reset_button_keeps_keyframes() {
+    let (mut d, clip) = Driver::demo();
+    let t0 = d.seek(0.5);
+    d.click(&format!("{SCALE}.addKeyframe"));
+    d.exec("effects.setParam", json!({"clip": clip.id, "effect": "motion", "param": "scale", "value": 150.0, "time": t0}));
+    d.seek(2.5);
+    d.click("effectControls.motion.scale.reset");
+    d.shot("effect-controls-reset");
+    let (keys, value) = d.scale(&clip);
+    assert_eq!(keys.len(), 2, "the keyframe stays and the default is keyed at the playhead: {keys:?}");
+    assert_eq!(value, 100.0);
+}
+
 /// Crop is not on a clip until it is used: its diamond applies the effect, then adds the keyframe.
 #[test]
 fn properties_diamond_applies_crop_first() {
@@ -224,4 +251,180 @@ fn effect_controls_ruler_moves_the_playhead() {
     d.exec("playhead.set", json!({"time": clip.start + clip.duration * 2}));
     assert!(d.find("effectControls.playhead").is_none(), "no handle while the playhead is past the clip");
     d.rect("effectControls.ruler");
+}
+
+/// #412: Scale and Position both have a keyframe at the same time. A click on Scale's keyframe in
+/// the Effect Controls lane selects that keyframe only (every keyframe under the playhead, which
+/// the click moves there, used to light up); a keyframe that is gone drops out of the selection.
+#[test]
+fn clicking_a_lane_keyframe_selects_only_that_keyframe() {
+    let (mut d, clip) = Driver::demo();
+    let t0 = d.seek(1.0);
+    for param in ["scale", "position"] {
+        d.exec("effects.addKeyframe", json!({"clip": clip.id, "effect": "motion", "param": param}));
+    }
+    let time = d.scale(&clip).0[0];
+    let motion = {
+        let s = &d.harness.state().session;
+        let it = s.active_sequence().unwrap().find_item(ClipId(clip.id)).unwrap().1;
+        it.effects.iter().position(|e| e.effect == "motion").unwrap()
+    };
+    let selection = |d: &mut Driver| d.ok("ui.inspect", json!({}))["ui"]["keyframe_selection"].clone();
+    d.seek(2.0);
+    assert_eq!(selection(&mut d), json!([]), "nothing selected yet");
+
+    d.click(&format!("effectControls.motion.scale.keyframe.{time}"));
+    assert_eq!(selection(&mut d), json!([{"clip": clip.id, "effect": motion, "param": "scale", "time": time}]), "only Scale's keyframe");
+    assert_eq!(d.playhead(), t0, "the click still moves the playhead to the keyframe");
+    d.shot("keyframes-select-one");
+
+    d.click(&format!("effectControls.motion.position.keyframe.{time}"));
+    assert_eq!(selection(&mut d), json!([{"clip": clip.id, "effect": motion, "param": "position", "time": time}]), "a click replaces the selection");
+
+    // the diamond removes the keyframe at the playhead, the selected one: the selection empties
+    d.click("effectControls.motion.position.addKeyframe");
+    assert_eq!(selection(&mut d), json!([]), "a deleted keyframe is not selected");
+}
+
+/// Effect Controls' divider (#643): dragging it widens the effect list or the keyframe area, each
+/// keeping a minimum width, and the width stays. The mouse wheel scrolls the rows over the
+/// keyframe area too, not only over the effect list.
+#[test]
+fn effect_controls_divider_and_scrolling_anywhere() {
+    let (mut d, clip) = Driver::demo();
+    let lane = d.rect("effectControls.lane");
+    let div = d.rect("effectControls.divider");
+    let (x, y) = (div[0] + div[2] / 2.0, div[1] + div[3] / 2.0);
+    d.ok("ui.drag", json!({"from": {"x": x, "y": y}, "to": {"x": x + 80.0, "y": y}, "steps": 6}));
+    let narrower = d.rect("effectControls.lane");
+    assert!((narrower[0] - (lane[0] + 80.0)).abs() <= 1.0, "the keyframe area starts 80 points further right: {narrower:?} vs {lane:?}");
+    assert!((narrower[0] + narrower[2] - (lane[0] + lane[2])).abs() <= 1.0, "and still ends at the panel's edge");
+    d.frames(3);
+    assert_eq!(d.rect("effectControls.lane"), narrower, "the width stays");
+    // dragged all the way right, the keyframe area keeps its minimum width
+    let drag_divider = |d: &mut Driver, by: f64| {
+        let div = d.rect("effectControls.divider");
+        let (x, y) = (div[0] + div[2] / 2.0, div[1] + div[3] / 2.0);
+        d.ok("ui.drag", json!({"from": {"x": x, "y": y}, "to": {"x": x + by, "y": y}, "steps": 6}));
+    };
+    drag_divider(&mut d, 3000.0);
+    assert!(d.rect("effectControls.lane")[2] >= 59.0, "the keyframe area can't vanish");
+    // and all the way left, the effect list keeps the width its rows are laid out for
+    drag_divider(&mut d, -3000.0);
+    assert!(d.rect("effectControls.effect.motion")[2] >= 259.0, "the effect list stays wide enough for its values");
+
+    // enough effects to scroll; the wheel over the keyframe area scrolls the rows
+    for fx in ["gaussian_blur", "transform", "crop", "tint"] {
+        d.exec("effects.apply", json!({"clips": [clip.id], "effect": fx}));
+    }
+    let before = d.rect("effectControls.motion.scale.stopwatch");
+    let lane = d.rect("effectControls.lane");
+    d.ok("ui.scroll", json!({"x": lane[0] + lane[2] / 2.0, "y": lane[1] + lane[3] * 0.7, "dx": 0.0, "dy": -80.0}));
+    d.frames(4);
+    let after = d.find("effectControls.motion.scale.stopwatch");
+    assert!(after.is_none_or(|r| r[1] < before[1] - 20.0), "the rows scrolled up: {before:?} → {after:?}");
+}
+
+/// #962: graph points need the same interpolation menu as lane diamonds, including either
+/// coordinate of Transform Position. Opening a menu never changes the value or creates an undo.
+#[test]
+fn graph_keyframes_offer_interpolation_and_clear_in_one_undo_step() {
+    for (effect, param, values, component) in [
+        ("motion", "scale", [json!(40.0), json!(80.0)], ""),
+        ("motion", "position", [json!([400.0, 300.0]), json!([800.0, 500.0])], ".x"),
+        ("transform", "position", [json!([400.0, 300.0]), json!([800.0, 500.0])], ".x"),
+        ("transform", "position", [json!([400.0, 300.0]), json!([800.0, 500.0])], ".y"),
+    ] {
+        let (mut d, clip) = Driver::demo();
+        if effect == "transform" {
+            d.exec("effects.apply", json!({"clips": [clip.id], "effect": effect}));
+            for intrinsic in ["motion", "opacity", "time_remap"] {
+                d.click(&format!("effectControls.effect.{intrinsic}"));
+            }
+        }
+        for (seconds, value) in [0.5, 2.5].into_iter().zip(values) {
+            d.seek(seconds);
+            d.exec("effects.addKeyframe", json!({"clip": clip.id, "effect": effect, "param": param}));
+            d.exec("effects.setParam", json!({"clip": clip.id, "effect": effect, "param": param, "value": value}));
+        }
+        d.click(&format!("effectControls.{effect}.{param}.graphs"));
+        let before = d.parameter(&clip, effect, param);
+        let undo = d.undo_len();
+        let target = format!("effectControls.{param}.graph.keyframe.{}{component}", before.keyframes[0].time.0);
+        for (key, interpolation) in [
+            ("bezier", Interpolation::Bezier),
+            ("autoBezier", Interpolation::AutoBezier),
+            ("continuousBezier", Interpolation::ContinuousBezier),
+            ("hold", Interpolation::Hold),
+            ("easeIn", Interpolation::EaseIn),
+            ("easeOut", Interpolation::EaseOut),
+            ("linear", Interpolation::Linear),
+        ] {
+            d.right_click(&target);
+            assert_eq!(d.parameter(&clip, effect, param), before, "opening the graph menu cannot edit {effect}.{param}{component}");
+            assert_eq!(d.undo_len(), undo);
+            if key == "easeIn" && effect == "transform" {
+                d.shot(&format!("graph-menu-{effect}-{param}{component}"));
+            }
+            d.click(&format!("effectControls.keyframeMenu.{key}"));
+            let changed = d.parameter(&clip, effect, param);
+            assert_eq!(changed.keyframes[0].interp, interpolation);
+            assert_eq!(changed.keyframes[0].time, before.keyframes[0].time);
+            assert_eq!(changed.keyframes[0].value, before.keyframes[0].value);
+            assert_eq!(changed.keyframes[1], before.keyframes[1]);
+            assert_eq!(d.undo_len(), undo + 1);
+            assert!(d.find("effectControls.keyframeMenu.clear").is_none(), "choosing interpolation closes the menu");
+            d.exec("edit.undo", json!({}));
+            assert_eq!(d.parameter(&clip, effect, param), before);
+            d.exec("edit.redo", json!({}));
+            assert_eq!(d.parameter(&clip, effect, param), changed);
+            d.exec("edit.undo", json!({}));
+        }
+        d.right_click(&target);
+        d.click("effectControls.keyframeMenu.clear");
+        let remaining = d.parameter(&clip, effect, param);
+        assert_eq!(remaining.keyframes, before.keyframes[1..]);
+        assert_eq!(d.undo_len(), undo + 1);
+        d.exec("edit.undo", json!({}));
+        assert_eq!(d.parameter(&clip, effect, param), before);
+    }
+}
+
+#[test]
+fn mask_keyframe_menus_preserve_the_effect_and_other_masks() {
+    let (mut d, clip) = Driver::demo();
+    d.ok("ui.set", json!({"workspace": "Effects"}));
+    for intrinsic in ["motion", "time_remap"] {
+        d.click(&format!("effectControls.effect.{intrinsic}"));
+    }
+    for mask in 0..2 {
+        d.exec("masks.add", json!({"clip": clip.id, "effect": "opacity", "shape": "ellipse"}));
+        for (seconds, value) in [(0.5, 20.0), (2.5, 60.0)] {
+            d.seek(seconds);
+            d.exec("effects.addKeyframe", json!({"clip": clip.id, "effect": "opacity", "mask": mask, "param": "feather"}));
+            d.exec("effects.setParam", json!({"clip": clip.id, "effect": "opacity", "mask": mask, "param": "feather", "value": value}));
+        }
+    }
+    let effect = |d: &Driver| d.harness.state().session.active_sequence().unwrap().find_item(ClipId(clip.id)).unwrap().1.effect("opacity").unwrap().clone();
+    let before = effect(&d);
+    let time = before.masks[0].param("feather").unwrap().keyframes[0].time.0;
+    let undo = d.undo_len();
+    for (target, key, interpolation) in [
+        (format!("effectControls.opacity.mask0.feather.keyframe.{time}"), "easeOut", Interpolation::EaseOut),
+        (format!("effectControls.feather.graph.keyframe.{time}"), "easeIn", Interpolation::EaseIn),
+    ] {
+        if key == "easeIn" {
+            d.click("effectControls.opacity.mask0.feather.graphs");
+        }
+        d.right_click(&target);
+        assert_eq!(effect(&d), before, "opening the menu cannot change any mask");
+        assert_eq!(d.undo_len(), undo);
+        d.click(&format!("effectControls.keyframeMenu.{key}"));
+        let mut expected = before.clone();
+        expected.masks[0].param_mut("feather").unwrap().keyframes[0].interp = interpolation;
+        assert_eq!(effect(&d), expected, "only the first mask's first feather keyframe changes");
+        assert_eq!(d.undo_len(), undo + 1);
+        d.exec("edit.undo", json!({}));
+        assert_eq!(effect(&d), before);
+    }
 }

@@ -140,11 +140,14 @@ pub(crate) fn tight_plane<T: Copy>(src: Vec<T>, stride: usize, w: usize, h: usiz
 }
 
 /// Colour of an H.264 / HEVC picture from its VUI code points (ITU-T H.273), as the decoders
-/// report it: BT.709 by default with the matrix guessed from the size, the signalled matrix and
-/// transfer when known, and full range when flagged. Shared by the software and hardware
-/// decoders so the two are interchangeable.
-pub fn vui_color(width: u32, height: u32, matrix: u8, transfer: u8, full_range: bool) -> filmcraft_color::ColorInfo {
+/// report it: BT.709 by default with the matrix guessed from the size, the signalled primaries,
+/// matrix and transfer when known, and full range when flagged. Shared by the software and
+/// hardware decoders so the two are interchangeable.
+pub fn vui_color(width: u32, height: u32, primaries: u8, matrix: u8, transfer: u8, full_range: bool) -> filmcraft_color::ColorInfo {
     let mut color = filmcraft_color::ColorInfo { matrix: filmcraft_frame::default_matrix(width, height), ..filmcraft_color::ColorInfo::REC709 };
+    if let Some(p) = primaries_from_code(primaries) {
+        color.primaries = p;
+    }
     if let Some(m) = filmcraft_color::Matrix::from_code(matrix) {
         color.matrix = m;
     }
@@ -224,7 +227,7 @@ impl H264Decoder {
     fn make_inner(avcc: &[u8], threads: usize) -> Result<filmcraft_h264::Decoder> {
         let mut dec = filmcraft_h264::Decoder::with_threads(threads);
         if !avcc.is_empty() {
-            dec.configure_avcc(avcc).map_err(|e| CodecError::Decode(e.to_string()))?;
+            dec.configure_avcc(avcc).map_err(h264_error)?;
         }
         Ok(dec)
     }
@@ -250,7 +253,7 @@ impl H264Decoder {
         let y = tight_plane(p.y, p.y_stride, w, h);
         let u = tight_plane(p.u, p.uv_stride, cw, ch);
         let v = tight_plane(p.v, p.uv_stride, cw, ch);
-        let color = vui_color(p.width, p.height, p.color.matrix, p.color.transfer, p.color.full_range);
+        let color = vui_color(p.width, p.height, p.color.primaries, p.color.matrix, p.color.transfer, p.color.full_range);
         let par = sar_par(p.sar);
         let frame = VideoFrame {
             width: p.width,
@@ -264,9 +267,19 @@ impl H264Decoder {
     }
 }
 
+/// An H.264 decoder error as a [`CodecError`]: a feature the decoder does not implement (High
+/// 4:2:2, field pictures...) is [`CodecError::Unsupported`], so the media pool shows the
+/// unreadable slate instead of a black picture (#626); anything else is a decode error.
+fn h264_error(e: filmcraft_h264::Error) -> CodecError {
+    match e {
+        filmcraft_h264::Error::Unsupported(what) => CodecError::Unsupported(format!("H.264: {what}")),
+        e => CodecError::Decode(e.to_string()),
+    }
+}
+
 impl VideoDecoder for H264Decoder {
     fn decode(&mut self, sample: &[u8], pts: i64) -> Result<Vec<DecodedFrame>> {
-        let pics = self.dec.decode(sample, pts).map_err(|e| CodecError::Decode(e.to_string()))?;
+        let pics = self.dec.decode(sample, pts).map_err(h264_error)?;
         Ok(pics.into_iter().map(Self::convert).collect())
     }
     fn flush(&mut self) -> Vec<DecodedFrame> {
@@ -328,7 +341,7 @@ pub struct HevcDecoder {
 
 impl HevcDecoder {
     pub fn new(hvcc: Vec<u8>) -> Result<Self> {
-        let dec = filmcraft_hevc::Decoder::from_hvcc(&hvcc).map_err(|e| CodecError::Decode(e.to_string()))?;
+        let dec = filmcraft_hevc::Decoder::from_hvcc(&hvcc).map_err(hevc_error)?;
         let (length_size, highest_tid) = hvcc_length_size_and_tid(&hvcc);
         Ok(Self { hvcc, dec, length_size, highest_tid })
     }
@@ -361,16 +374,24 @@ impl HevcDecoder {
                 alpha: None,
             },
         };
-        let color = vui_color(p.width, p.height, p.color.matrix, p.color.transfer, p.color.full_range);
+        let color = vui_color(p.width, p.height, p.color.primaries, p.color.matrix, p.color.transfer, p.color.full_range);
         let par = sar_par(p.sar);
         let frame = VideoFrame { width: p.width, height: p.height, data, color, par, pts: filmcraft_time::Tick::ZERO };
         DecodedFrame { pts: p.pts, frame, draft: p.draft }
     }
 }
 
+/// An HEVC decoder error as a [`CodecError`] (see [`h264_error`]).
+fn hevc_error(e: filmcraft_hevc::Error) -> CodecError {
+    match e {
+        filmcraft_hevc::Error::Unsupported(what) => CodecError::Unsupported(format!("HEVC: {what}")),
+        e => CodecError::Decode(e.to_string()),
+    }
+}
+
 impl VideoDecoder for HevcDecoder {
     fn decode(&mut self, sample: &[u8], pts: i64) -> Result<Vec<DecodedFrame>> {
-        let pics = self.dec.decode(sample, pts).map_err(|e| CodecError::Decode(e.to_string()))?;
+        let pics = self.dec.decode(sample, pts).map_err(hevc_error)?;
         Ok(pics.into_iter().map(Self::convert).collect())
     }
     fn flush(&mut self) -> Vec<DecodedFrame> {

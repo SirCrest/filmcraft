@@ -3,8 +3,8 @@
 //! Update Metadata, Automate to Sequence, Scene Edit Detection, Normalize Mix Track, Simplify
 //! Sequence, Transcribe Sequence, Save as Template, Add Flash Cue Marker and the System
 //! Compatibility Report; plus the frontend side of Edit Original / Reveal Log Files (the OS
-//! opener), Generate Audio Waveform (the timeline's peak cache), Import from Media Browser (the
-//! Media Browser selection) and View ▸ Dynamic Audio Waveforms.
+//! opener), Reveal in Finder, Generate Audio Waveform (the timeline's peak cache), Import from
+//! Media Browser (the Media Browser selection) and View ▸ Dynamic Audio Waveforms.
 //!
 //! The open dialog lives in `UiState::extras.dialog` (serde, like `clip_dialogs`): the engine
 //! command it runs and the parameters being edited, so agents open it from the menu, change
@@ -185,11 +185,12 @@ pub fn route(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, params: &Val
             app.ui.extras.dialog = Some(ClipDialogDraft { command: id.into(), params: json!({}), info: report.clone(), error: String::new() });
             return Some(Ok(json!({"dialog": "systemReport", "report": report})));
         }
-        "edit.editOriginal" => {
+        "edit.editOriginal" | "file.reveal" => {
+            let reveal = id == "file.reveal";
             let r = app.session.execute(id, params.clone()).map_err(|e| e.to_string());
             return Some(r.and_then(|v| {
                 for p in v["paths"].as_array().cloned().unwrap_or_default() {
-                    open_path(app, ctx, p.as_str().unwrap_or_default(), false)?;
+                    open_path(app, ctx, p.as_str().unwrap_or_default(), reveal)?;
                 }
                 Ok(v)
             }));
@@ -199,7 +200,8 @@ pub fn route(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, params: &Val
             if let Ok(v) = &r {
                 let mut peaks = app.tl.peaks.lock().unwrap_or_else(|e| e.into_inner());
                 for i in v["items"].as_array().cloned().unwrap_or_default() {
-                    peaks.remove(&filmcraft_engine::project::ItemId(i.as_u64().unwrap_or_default()));
+                    let item = filmcraft_engine::project::ItemId(i.as_u64().unwrap_or_default());
+                    peaks.retain(|(it, _), _| *it != item);
                 }
             }
             return Some(r);
@@ -445,6 +447,7 @@ fn pairs(v: &[&str]) -> Vec<(String, String)> {
 /// Draw the open dialog, if any.
 pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
     let Some(mut d) = app.ui.extras.dialog.clone() else { return };
+    crate::widgets::revert_drag_on_escape(ctx, egui::Id::new("menu-dialog-before-drag"), &mut d);
     let Some((title, pre, ok_text)) = meta(&d.command) else {
         app.ui.extras.dialog = None;
         return;
@@ -706,8 +709,8 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
             }
             "clip.sceneEditDetection" => {
                 check(ui, &mut elems, pre, p, "applyCuts", tl!("Apply a cut at each detected cut point"));
-                check(ui, &mut elems, pre, p, "createSubclips", tl!("Create a subclip for each detected cut point"));
-                check(ui, &mut elems, pre, p, "generateMarkers", tl!("Generate clip markers at each detected cut point"));
+                check(ui, &mut elems, pre, p, "createSubclips", tl!("Create a bin of subclips from each detected cut point"));
+                check(ui, &mut elems, pre, p, "generateMarkers", tl!("Create a clip marker at each detected cut point"));
                 ui.horizontal(|ui| {
                     ui.label(tl!("Sensitivity:"));
                     let mut v = p["sensitivity"].as_f64().unwrap_or(50.0);
@@ -827,7 +830,7 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
     {
         d.params[k.as_str()] = json!(dir);
     }
-    if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+    if crate::widgets::escape_closes(ctx) {
         action = Some("cancel");
     }
     match action {

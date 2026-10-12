@@ -342,8 +342,21 @@ fn section(ui: &mut egui::Ui, reg: &mut Reg, open: &mut Vec<String>, key: &str, 
 }
 
 fn drag(ui: &mut egui::Ui, reg: &mut Reg, id: &str, v: &mut f64, range: std::ops::RangeInclusive<f64>, speed: f64, suffix: &str, decimals: usize) -> bool {
+    let before = *v;
     let r = ui.add(egui::DragValue::new(v).range(range).speed(speed).suffix(suffix).max_decimals(decimals));
     reg.add(id, r.rect, format!("{v}"));
+    // a drag ended by Escape goes back to the value it started from (egui ends the drag, #580)
+    let home = r.id.with("before-drag");
+    if r.drag_started() {
+        ui.data_mut(|d| d.insert_temp(home, before));
+    }
+    if r.drag_stopped()
+        && let Some(b) = ui.data_mut(|d| d.remove_temp::<f64>(home))
+        && ui.input(|i| i.key_pressed(egui::Key::Escape))
+    {
+        *v = b;
+        return true;
+    }
     r.changed()
 }
 
@@ -473,7 +486,7 @@ fn settings_column(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
         }
         if (s.has_audio()
             || !s.has_video()
-            || s.format.is_h26x()
+            || s.format.is_mp4_video()
             || matches!(s.format, Format::ProRes | Format::DnxHr | Format::Apv | Format::Mjpeg)
             || s.format.is_mxf())
             && !s.is_image_sequence()
@@ -521,7 +534,7 @@ fn settings_column(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
         if section(ui, &mut reg, &mut ex.open_sections, "effects", tl!("Effects"), &t) {
             pick_overlay = effects_section(ui, &mut reg, s, &t);
         }
-        if matches!(s.format, Format::H264 | Format::Hevc | Format::ProRes | Format::DnxHr | Format::Apv | Format::Mjpeg)
+        if matches!(s.format, Format::H264 | Format::Hevc | Format::Av1 | Format::ProRes | Format::DnxHr | Format::Apv | Format::Mjpeg)
             && section(ui, &mut reg, &mut ex.open_sections, "metadata", tl!("Metadata"), &t)
         {
             let m = &mut s.metadata;
@@ -606,23 +619,29 @@ fn video_section(ui: &mut egui::Ui, reg: &mut Reg, s: &mut ExportSettings, t: &T
             }
         });
     }
-    if matches!(s.format, Format::PngSequence | Format::TiffSequence) {
+    if s.supports_alpha() {
         row(ui, t, tl!("Alpha"), |ui| {
             check(ui, reg, "export.video.alpha", &mut s.alpha, tl!("Include Alpha Channel"));
         });
     }
     match s.video_format() {
-        f @ (Format::H264 | Format::Hevc) => {
-            let hevc = f == Format::Hevc;
+        f @ (Format::H264 | Format::Hevc | Format::Av1) => {
+            // H.265 and AV1: hardware encoders only (one profile, level chosen by the encoder)
+            let hevc = f != Format::H264;
             if hevc {
-                // the hardware encoder writes Main (8-bit 4:2:0), or Main 10 for HDR sequences where it can; level chosen by the encoder
-                let label = match (filmcraft_engine::export::hdr_available(Format::Hevc), seq_hdr && !s.sdr) {
-                    (true, true) => tl!("Main 10 (10-bit, HDR)"),
-                    (true, false) => tl!("Main (8-bit; Main 10 for HDR sequences)"),
-                    (false, _) => tl!("Main (8-bit)"),
-                };
-                row(ui, t, tl!("Profile"), |ui| ui.label(label));
-                row(ui, t, tl!("Encoder"), |ui| ui.label(tl!("Hardware (H.265 has no software encoder)")));
+                if f == Format::Av1 {
+                    row(ui, t, tl!("Profile"), |ui| ui.label(tl!("Main (8-bit)")));
+                    row(ui, t, tl!("Encoder"), |ui| ui.label(tl!("Hardware (AV1 has no software encoder)")));
+                } else {
+                    // the hardware encoder writes Main (8-bit 4:2:0), or Main 10 for HDR sequences where it can; level chosen by the encoder
+                    let label = match (filmcraft_engine::export::hdr_available(Format::Hevc), seq_hdr && !s.sdr) {
+                        (true, true) => tl!("Main 10 (10-bit, HDR)"),
+                        (true, false) => tl!("Main (8-bit; Main 10 for HDR sequences)"),
+                        (false, _) => tl!("Main (8-bit)"),
+                    };
+                    row(ui, t, tl!("Profile"), |ui| ui.label(label));
+                    row(ui, t, tl!("Encoder"), |ui| ui.label(tl!("Hardware (H.265 has no software encoder)")));
+                }
             } else {
                 row(ui, t, tl!("Profile"), |ui| {
                     let o = [H264Profile::Baseline, H264Profile::Main, H264Profile::High];
@@ -642,14 +661,22 @@ fn video_section(ui: &mut egui::Ui, reg: &mut Reg, s: &mut ExportSettings, t: &T
                 });
             }
             row(ui, t, tl!("Bitrate Encoding"), |ui| {
-                // a hardware encoder has one pass: H.265 offers no two-pass mode
-                let o = [BitrateMode::Cbr, BitrateMode::Vbr1Pass, BitrateMode::Vbr2Pass];
-                let labels: Vec<(String, bool)> = o.iter().map(|m| (m.label().to_string(), !(hevc && *m == BitrateMode::Vbr2Pass))).collect();
+                // a hardware encoder has one pass and no constant-quality mode: H.265 offers neither
+                let o = [BitrateMode::Cbr, BitrateMode::Vbr1Pass, BitrateMode::Vbr2Pass, BitrateMode::Crf];
+                let labels: Vec<(String, bool)> =
+                    o.iter().map(|m| (m.label().to_string(), !(hevc && matches!(m, BitrateMode::Vbr2Pass | BitrateMode::Crf)))).collect();
                 if let Some(i) = combo(ui, reg, "export.video.bitrateMode", s.bitrate_mode.label(), &labels, 140.0) {
                     s.bitrate_mode = o[i];
                 }
             });
-            if let Some(bpp) = s.adaptive_bitrate {
+            if s.bitrate_mode == BitrateMode::Crf {
+                row(ui, t, tl!("Quality (CRF)"), |ui| {
+                    let mut crf = if s.crf.is_finite() { f64::from(s.crf) } else { f64::from(filmcraft_engine::export::DEFAULT_CRF) };
+                    if drag(ui, reg, "export.video.crf", &mut crf, 0.0..=51.0, 0.1, "", 0) {
+                        s.crf = crf.round() as f32;
+                    }
+                });
+            } else if let Some(bpp) = s.adaptive_bitrate {
                 row(ui, t, tl!("Target Bitrate"), |ui| {
                     ui.label(egui::RichText::new(tlf!("Adaptive ({bpp} bits per pixel)", bpp)).size(12.0));
                     let r = ui.small_button(tl!("Set"));
@@ -686,9 +713,9 @@ fn video_section(ui: &mut egui::Ui, reg: &mut Reg, s: &mut ExportSettings, t: &T
                 }
             });
             // The system's hardware encoder where there is one (VideoToolbox on macOS, NVENC on NVIDIA
-            // GPUs on Windows); everything it does not take (two-pass, HDR, MXF) and every machine
-            // without one keeps the built-in encoder.
-            // H.265 has only the hardware encoder: choosing the format is the opt-in.
+            // GPUs on Windows, VA-API on Linux); everything it does not take (two-pass, HDR, MXF) and
+            // every machine without one keeps the built-in encoder.
+            // H.265 and AV1 have only hardware encoders: choosing the format is the opt-in.
             if !hevc {
                 row(ui, t, "Hardware Encoding", |ui| {
                     let mut on = s.hardware_encoding == HardwareEncoding::Auto;
@@ -700,8 +727,9 @@ fn video_section(ui: &mut egui::Ui, reg: &mut Reg, s: &mut ExportSettings, t: &T
         }
         Format::ProRes => {
             row(ui, t, tl!("Profile"), |ui| {
-                let keys = ["proxy", "lt", "standard", "hq"];
-                let labels = ["Apple ProRes 422 Proxy", "Apple ProRes 422 LT", "Apple ProRes 422", "Apple ProRes 422 HQ"];
+                let keys = ["proxy", "lt", "standard", "hq", "4444", "4444xq"];
+                let labels =
+                    ["Apple ProRes 422 Proxy", "Apple ProRes 422 LT", "Apple ProRes 422", "Apple ProRes 422 HQ", "Apple ProRes 4444", "Apple ProRes 4444 XQ"];
                 let cur = keys.iter().position(|k| *k == s.prores_profile).unwrap_or(3);
                 if let Some(i) = combo(ui, reg, "export.video.proresProfile", labels[cur], &opts(&labels), 220.0) {
                     s.prores_profile = keys[i].into();
@@ -728,7 +756,7 @@ fn video_section(ui: &mut egui::Ui, reg: &mut Reg, s: &mut ExportSettings, t: &T
                 }
             });
         }
-        Format::Mjpeg => {
+        Format::Mjpeg | Format::JpegSequence => {
             row(ui, t, tl!("Quality"), |ui| {
                 let mut q = s.quality as f64;
                 drag(ui, reg, "export.video.quality", &mut q, 1.0..=100.0, 1.0, "", 0);
@@ -758,13 +786,12 @@ fn audio_section(ui: &mut egui::Ui, reg: &mut Reg, s: &mut ExportSettings, t: &T
         }
     }
     row(ui, t, tl!("Audio Format"), |ui| {
-        let fixed = s.format.is_h26x() && s.multiplexer == Multiplexer::Mp4 || audio_only || s.format.is_mxf();
+        let fixed = s.format.is_mp4_with(s.multiplexer) || audio_only || s.format.is_mxf();
         let cur = match s.audio_codec() {
             AudioCodec::Aac => "AAC",
             _ => tl!("Uncompressed (PCM)"),
         };
-        let labels =
-            vec![("AAC".to_string(), !audio_only), (tl!("Uncompressed (PCM)").to_string(), !(s.format.is_h26x() && s.multiplexer == Multiplexer::Mp4))];
+        let labels = vec![("AAC".to_string(), !audio_only), (tl!("Uncompressed (PCM)").to_string(), !s.format.is_mp4_with(s.multiplexer))];
         if fixed {
             ui.label(cur);
         } else if let Some(i) = combo(ui, reg, "export.audio.codec", cur, &labels, 180.0) {
@@ -1191,7 +1218,7 @@ fn preset_manager(app: &mut FilmcraftApp, ctx: &egui::Context) {
     {
         close = true;
     }
-    app.ui.export.manager = if close || !open || ctx.input(|i| i.key_pressed(egui::Key::Escape)) { None } else { Some(m) };
+    app.ui.export.manager = if close || !open || crate::widgets::escape_closes(ctx) { None } else { Some(m) };
 }
 
 /// A five-pointed star (favourite marker), drawn from scratch.
@@ -1312,7 +1339,7 @@ pub fn quick_export(app: &mut FilmcraftApp, ctx: &egui::Context, anchor: egui::P
         }
         close = true;
     }
-    if close || ctx.input(|i| i.key_pressed(egui::Key::Escape)) || (clicked_elsewhere && !toggled) {
+    if close || crate::widgets::escape_closes(ctx) || (clicked_elsewhere && !toggled) {
         app.ui.export.quick_open = false;
     }
 }

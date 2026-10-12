@@ -28,7 +28,10 @@ pub enum Which {
 pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, which: Which) {
     let t = app.tokens;
     let ctx = ui.ctx().clone();
-    let controls_h = 28.0 + 24.0 + 36.0;
+    let stacked_controls = rect.width() < 540.0;
+    let separate_source_drag = which == Which::Source && stacked_controls && rect.width() < 310.0;
+    let source_drag_h = if separate_source_drag { 26.0 } else { 0.0 };
+    let controls_h = 28.0 + 24.0 + 36.0 + if stacked_controls { 26.0 } else { 0.0 } + source_drag_h;
     let video_area = Rect::from_min_max(rect.min + vec2(4.0, 4.0), pos2(rect.max.x - 4.0, rect.max.y - controls_h));
     // the Source monitor's time ruler starts at `origin` (a subclip restricted to its range)
     let mut origin = Tick::ZERO;
@@ -279,11 +282,17 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, which: Which)
         let c = if app.playback.meter.counts().1 > 0 { t.render_yellow } else { t.render_green };
         ui.painter().circle_filled(pos2(video_area.min.x + 10.0, video_area.min.y + 10.0), 4.0, c);
     }
+    // A click on the Program monitor around the picture lets go of what is selected on it (#683;
+    // in the picture the overlays do that). Under the picture and the overlays, so they come first.
+    if which == Which::Program && show_picture && ui.interact(video_area, egui::Id::new((prefix, "background")), Sense::click()).clicked() {
+        crate::panels::graphics::deselect_on_monitor(app, ui);
+    }
     // Click/drag in the picture: the Hand tool pans a magnified picture, otherwise focus.
     let pic_resp = ui.interact(pic, egui::Id::new((prefix, "pic")), if show_picture { Sense::click_and_drag() } else { Sense::hover() });
     app.auto.add(&format!("{prefix}.picture"), pic.intersect(video_area), "picture");
-    if show_picture {
-        monitor_view::pan_input(app, ui, which, video_area, pic);
+    // (Comparison View always fits both frames)
+    if show_picture && !compare {
+        monitor_view::zoom_pan_input(app, ui, which, video_area, pic, display_w, ppp);
     }
     if which == Which::Program && show_picture {
         eyedropper(app, ui, &pic_resp, pic, target, rate, time);
@@ -323,8 +332,16 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, which: Which)
     app.auto.add(&format!("{prefix}.timecode"), tc_rect, &tc);
     let dur_tc = format_time(mark_out.map(|o| o + rate.frame_duration()).unwrap_or(duration) - range_start, rate, drop_frame, TimeDisplay::Timecode, 48000);
     ui.painter().text(pos2(row1.max.x, row1.center().y), Align2::RIGHT_CENTER, &dur_tc, Tokens::timecode(), t.text_dim);
-    // zoom + resolution dropdowns centred-ish
-    let zr = Rect::from_min_size(pos2(row1.min.x + 116.0, row1.min.y), vec2(70.0, 24.0));
+    // At compact widths, timecodes and view settings need separate rows.
+    let settings_y = row1.min.y + if stacked_controls { 26.0 } else { 0.0 };
+    let zoom_x = if stacked_controls && which == Which::Source && !separate_source_drag {
+        row1.min.x
+    } else if stacked_controls {
+        row1.center().x - 83.0
+    } else {
+        row1.min.x + 116.0
+    };
+    let zr = Rect::from_min_size(pos2(zoom_x, settings_y), vec2(70.0, 24.0));
     let zoom_label = match mv.zoom {
         None => tl!("Fit").to_string(),
         Some(z) => format!("{}%", (z * 100.0).round() as i32),
@@ -333,9 +350,19 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, which: Which)
     app.auto.add(&format!("{prefix}.zoom"), zr, "Select Zoom Level");
     monitor_view::zoom_menu(app, &zresp, which);
     let res = mv.res;
-    let rr = Rect::from_min_size(pos2(row1.max.x - 196.0, row1.min.y), vec2(62.0, 24.0));
+    let resolution_x = if stacked_controls && which == Which::Source && !separate_source_drag {
+        row1.max.x - 90.0
+    } else if stacked_controls {
+        zr.max.x + 6.0
+    } else {
+        row1.max.x - 196.0
+    };
+    let rr = Rect::from_min_size(pos2(resolution_x, settings_y), vec2(62.0, 24.0));
     if which == Which::Source && rr.min.x > zr.max.x + 12.0 {
-        crate::panels::source_drag::controls(app, ui, Rect::from_min_max(pos2(zr.max.x + 6.0, row1.min.y), pos2(rr.min.x - 6.0, row1.min.y + 24.0)));
+        crate::panels::source_drag::controls(app, ui, Rect::from_min_max(pos2(zr.max.x + 6.0, settings_y), pos2(rr.min.x - 6.0, settings_y + 24.0)));
+    }
+    if separate_source_drag {
+        crate::panels::source_drag::controls(app, ui, Rect::from_min_size(pos2(row1.center().x - 52.0, settings_y + 26.0), vec2(104.0, 24.0)));
     }
     let rresp = crate::widgets::dropdown_text(ui, rr, crate::i18n::t(res.label()), &t, egui::Id::new((prefix, "res")));
     app.auto.add(&format!("{prefix}.resolution"), rr, "Select Playback Resolution");
@@ -346,7 +373,7 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, which: Which)
             }
         }
     });
-    let wr = Rect::from_min_size(pos2(rr.max.x + 6.0, row1.min.y + 1.0), vec2(22.0, 22.0));
+    let wr = Rect::from_min_size(pos2(rr.max.x + 6.0, settings_y + 1.0), vec2(22.0, 22.0));
     let wresp = ui.interact(wr, egui::Id::new((prefix, "wrench")), Sense::click());
     icons::paint(ui.painter(), wr.shrink(4.0), Icon::Wrench, if wresp.hovered() { t.tab_text_active } else { t.icon });
     app.auto.add(&format!("{prefix}.settings"), wr, "Settings");
@@ -402,7 +429,7 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, which: Which)
         }
     });
     // ---- mini timeline / scrub bar
-    let bar = Rect::from_min_size(pos2(rect.min.x + 14.0, row1.max.y + 2.0), vec2(rect.width() - 28.0, 22.0));
+    let bar = Rect::from_min_size(pos2(rect.min.x + 14.0, settings_y + 28.0 + source_drag_h), vec2(rect.width() - 28.0, 22.0));
     mini_timeline(app, ui, bar, which, origin, time, duration, rate, mark_in, mark_out);
 
     // ---- transport buttons
@@ -692,6 +719,19 @@ fn mini_timeline(
     }
 }
 
+// A hidden transport action is still available through its regular shortcut/menu.
+fn transport_visible(hidden: &[String], command: &str) -> bool {
+    !hidden.iter().any(|id| id == command)
+}
+
+fn set_transport_visible(hidden: &mut Vec<String>, command: &str, visible: bool) {
+    if visible {
+        hidden.retain(|id| id != command);
+    } else if transport_visible(hidden, command) {
+        hidden.push(command.to_owned());
+    }
+}
+
 fn transport(app: &mut FilmcraftApp, ui: &mut egui::Ui, row: Rect, which: Which) {
     let t = app.tokens;
     let src = which == Which::Source;
@@ -726,51 +766,178 @@ fn transport(app: &mut FilmcraftApp, ui: &mut egui::Ui, row: Rect, which: Which)
             (Icon::Proxy, "media.toggleProxies", tl!("Toggle Proxies")),
         ]
     };
-    let bw = 30.0;
-    let total = buttons.len() as f32 * bw;
-    let mut x = row.center().x - total / 2.0;
-    let ctx = ui.ctx().clone();
-    let prefix = if src { "source" } else { "program" };
-    for (icon, cmd, tip) in buttons {
-        let r = Rect::from_min_size(pos2(x, row.min.y + 2.0), vec2(bw - 2.0, 26.0));
-        let resp = ui.interact(r, egui::Id::new((prefix, cmd)), Sense::click()).on_hover_text(tip);
-        app.auto.add(&format!("{prefix}.transport.{cmd}"), r, tip);
-        let is_play = cmd.ends_with("play") || cmd == "playback.toggle";
-        if resp.hovered() {
-            ui.painter().rect_filled(r, 4.0, t.hover);
-        }
-        let sz = if is_play { 16.0 } else { 14.0 };
-        let on = cmd == "media.toggleProxies" && app.session.media.use_proxies();
-        let col = if on {
-            t.accent
-        } else if resp.hovered() {
-            t.tab_text_active
-        } else {
-            t.icon
-        };
-        icons::paint(ui.painter(), Rect::from_center_size(r.center(), vec2(sz, sz)), icon, col);
-        if resp.clicked() {
-            let r = match cmd {
-                "src.markIn" => app.session.execute("markers.markIn", json!({"target": "source"})).map_err(|e| e.to_string()),
-                "src.markOut" => app.session.execute("markers.markOut", json!({"target": "source"})).map_err(|e| e.to_string()),
-                "src.goIn" | "src.goOut" | "src.stepBack" | "src.stepFwd" => {
-                    source_nav(app, cmd);
-                    Ok(serde_json::Value::Null)
-                }
-
-                "exportFrame" => crate::menus::invoke(app, &ctx, "file.exportFrame", json!({"monitor": if src { "source" } else { "program" }})),
-                c => crate::menus::invoke(app, &ctx, c, json!({"monitor": if src { "source" } else { "program" }})),
-            };
-            if let Err(e) = r {
-                app.ui.status = e;
-            }
-        }
-        x += bw;
+    let mut buttons = buttons;
+    if !src {
+        buttons.push((Icon::Loop, "playback.loop", tl!("Loop")));
     }
-    // button editor "+"
-    let r = Rect::from_min_size(pos2(row.max.x - 30.0, row.min.y + 4.0), vec2(22.0, 22.0));
-    let resp = ui.interact(r, egui::Id::new((prefix, "btn-editor")), Sense::click()).on_hover_text(tl!("Button Editor"));
-    icons::paint(ui.painter(), r.shrink(5.0), Icon::Plus, if resp.hovered() { t.tab_text_active } else { t.text_dim });
+    let hidden = monitor_view::view(app, which).transport_hidden.clone();
+    let all_buttons = buttons.clone();
+    buttons.retain(|(_, command, _)| transport_visible(&hidden, command));
+    let prefix = if src { "source" } else { "program" };
+    if row.width() >= 30.0 {
+        // Keep the existing button-editor affordance only when it has its own space.
+        // Customize this monitor's transport separately from the other monitor.
+        let r = Rect::from_min_size(pos2(row.max.x - 30.0, row.min.y + 4.0), vec2(22.0, 22.0));
+        let resp = ui.interact(r, egui::Id::new((prefix, "btn-editor")), Sense::click()).on_hover_text(tl!("Button Editor"));
+        app.auto.add(&format!("{prefix}.transport.editor"), r, "Button Editor");
+        icons::paint(ui.painter(), r.shrink(5.0), Icon::Plus, if resp.hovered() { t.tab_text_active } else { t.text_dim });
+        let mut edited_hidden = hidden.clone();
+        let editor_width = (ui.ctx().content_rect().width() - 10.0).clamp(1.0, 225.0);
+        let editor_height = (ui.ctx().content_rect().height() - 16.0).max(1.0);
+        egui::Popup::menu(&resp).width(editor_width).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+            ui.set_width(editor_width);
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+            let scroll = egui::ScrollArea::vertical().id_salt((prefix, "editor-scroll")).max_height(editor_height).show(ui, |ui| {
+                for &(_, cmd, tip) in &all_buttons {
+                    let mut visible = transport_visible(&edited_hidden, cmd);
+                    let checkbox = ui.checkbox(&mut visible, tip);
+                    app.auto.add(&format!("{prefix}.transport.editor.{cmd}"), checkbox.rect, tip);
+                    if checkbox.changed() {
+                        set_transport_visible(&mut edited_hidden, cmd, visible);
+                    }
+                }
+                ui.separator();
+                let reset = ui.button(tl!("Reset"));
+                app.auto.add(&format!("{prefix}.transport.editor.reset"), reset.rect, "Reset");
+                if reset.clicked() {
+                    edited_hidden = crate::state::MonitorView::default().transport_hidden;
+                }
+            });
+            app.auto.add(&format!("{prefix}.transport.editor.scroll"), scroll.inner_rect, "Button editor");
+        });
+        if edited_hidden != hidden {
+            monitor_view::view_mut(app, which).transport_hidden = edited_hidden;
+        }
+    }
+    let available = (row.width() - 46.0).max(0.0);
+    let widths = vec![28.0; buttons.len()];
+    let Some(fit) = craft_ui::layout::fit_toolbar(&widths, available, 2.0, 28.0) else {
+        ui.scope_builder(egui::UiBuilder::new().max_rect(Rect::from_min_max(row.min, pos2((row.right() - 30.0).max(row.left()), row.bottom()))), |ui| {
+            egui::ScrollArea::horizontal().id_salt((prefix, "transport-scroll")).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    for (icon, command, label) in &buttons {
+                        let (rect, _) = ui.allocate_exact_size(vec2(28.0, 26.0), Sense::hover());
+                        if transport_button(app, ui, rect, prefix, *icon, command, label) {
+                            invoke_transport(app, ui.ctx(), which, command);
+                        }
+                    }
+                });
+            });
+        });
+        return;
+    };
+    let total = fit.shown.len() as f32 * 30.0 - 2.0 + if fit.overflow.is_empty() { 0.0 } else { 30.0 };
+    let mut x = row.center().x - 15.0 - total.max(28.0) / 2.0;
+    for (index, _) in &fit.shown {
+        let Some((icon, command, label)) = buttons.get(*index) else { continue };
+        let rect = Rect::from_min_size(pos2(x, row.min.y + 2.0), vec2(28.0, 26.0));
+        if transport_button(app, ui, rect, prefix, *icon, command, label) {
+            invoke_transport(app, ui.ctx(), which, command);
+        }
+        x += 30.0;
+    }
+    if !fit.overflow.is_empty() {
+        let rect = Rect::from_min_size(pos2(x, row.min.y + 2.0), vec2(28.0, 26.0));
+        let response = ui.interact(rect, egui::Id::new((prefix, "transport-more")), Sense::click()).on_hover_text(tl!("More transport controls"));
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, tl!("More transport controls")));
+        if response.hovered() {
+            ui.painter().rect_filled(rect, 4.0, t.hover);
+        }
+        for offset in [-5.0, 0.0, 5.0] {
+            ui.painter().circle_filled(rect.center() + vec2(offset, 0.0), 1.5, t.icon);
+        }
+        if response.has_focus() {
+            ui.painter().rect_stroke(rect.shrink(2.0), 2.0, Stroke::new(1.0, t.focus), StrokeKind::Inside);
+        }
+        app.auto.add_response(&format!("{prefix}.transport.more"), &response, "More transport controls");
+        egui::Popup::menu(&response).show(|ui| {
+            for index in &fit.overflow {
+                let Some((_, command, label)) = buttons.get(*index) else { continue };
+                let selected = match *command {
+                    "media.toggleProxies" => Some(app.session.media.use_proxies()),
+                    "playback.toggle" => Some(app.playback.playing),
+                    "source.playback.toggle" => Some(app.source_playback.clock.playing),
+                    _ => None,
+                };
+                let response = if let Some(selected) = selected { ui.selectable_label(selected, *label) } else { ui.button(*label) };
+                app.auto.add_response(&format!("{prefix}.transport.{command}"), &response, label);
+                if response.clicked() {
+                    invoke_transport(app, ui.ctx(), which, command);
+                    ui.close();
+                }
+            }
+        });
+    }
+}
+
+fn transport_button(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, prefix: &str, icon: Icon, command: &str, label: &str) -> bool {
+    let t = app.tokens;
+    let response = ui.interact(rect, egui::Id::new((prefix, command)), Sense::click()).on_hover_text(label);
+    app.auto.add_response(&format!("{prefix}.transport.{command}"), &response, label);
+    if response.hovered() {
+        ui.painter().rect_filled(rect, 4.0, t.hover);
+    }
+    let size = if matches!(command, "playback.toggle" | "source.playback.toggle") { 16.0 } else { 14.0 };
+    let color = if command == "media.toggleProxies" && app.session.media.use_proxies() {
+        t.accent
+    } else if response.hovered() {
+        t.tab_text_active
+    } else {
+        t.icon
+    };
+    icons::paint(ui.painter(), Rect::from_center_size(rect.center(), vec2(size, size)), icon, color);
+    response.clicked()
+}
+
+fn invoke_transport(app: &mut FilmcraftApp, ctx: &egui::Context, which: Which, command: &str) {
+    let source = which == Which::Source;
+    let result = match command {
+        "src.markIn" => app.session.execute("markers.markIn", json!({"target": "source"})).map_err(|error| error.to_string()),
+        "src.markOut" => app.session.execute("markers.markOut", json!({"target": "source"})).map_err(|error| error.to_string()),
+        "src.goIn" | "src.goOut" | "src.stepBack" | "src.stepFwd" => {
+            source_nav(app, command);
+            Ok(serde_json::Value::Null)
+        }
+        "exportFrame" => crate::menus::invoke(app, ctx, "file.exportFrame", json!({"monitor": if source { "source" } else { "program" }})),
+        command => crate::menus::invoke(app, ctx, command, json!({"monitor": if source { "source" } else { "program" }})),
+    };
+    if let Err(error) = result {
+        app.ui.status = error;
+    }
+}
+
+/// The Source panel menu's clips (#313): the recently opened clips, the shown one ticked, to
+/// switch between, then Close / Close All. Returns whether the menu is done.
+pub fn source_panel_menu(app: &mut FilmcraftApp, ui: &mut egui::Ui) -> bool {
+    let mut done = false;
+    let current = app.session.state.source_item;
+    let recent: Vec<(u64, String)> =
+        app.session.state.source_history.iter().filter_map(|i| app.session.project.item(*i).map(|it| (i.0, it.name.clone()))).collect();
+    for (id, name) in &recent {
+        let shown = current.is_some_and(|c| c.0 == *id);
+        let r = ui.button(if shown { format!("✓ {name}") } else { name.clone() });
+        app.auto.add(&format!("panel.menu.Source.recent.{id}"), r.rect, name);
+        if r.clicked() {
+            if !shown && let Err(e) = app.session.execute("source.open", json!({"item": id})) {
+                app.ui.status = e.to_string();
+            }
+            done = true;
+        }
+    }
+    if !recent.is_empty() {
+        ui.separator();
+    }
+    for (cmd, id, label) in [("source.close", "close", tl!("Close")), ("source.closeAll", "closeAll", tl!("Close All"))] {
+        let r = ui.add_enabled(current.is_some(), egui::Button::new(label));
+        app.auto.add(&format!("panel.menu.Source.{id}"), r.rect, label);
+        if r.clicked() {
+            if let Err(e) = app.session.execute(cmd, json!({})) {
+                app.ui.status = e.to_string();
+            }
+            done = true;
+        }
+    }
+    done
 }
 
 fn source_nav(app: &mut FilmcraftApp, cmd: &str) {
@@ -795,6 +962,21 @@ mod tests {
 
     fn flat(w: usize, h: usize, rgba: [u8; 4]) -> Rgba {
         Rgba { w, h, px: rgba.iter().copied().cycle().take(w * h * 4).collect() }
+    }
+
+    #[test]
+    fn button_editor_updates_visibility_without_affecting_other_monitor() {
+        let mut program = crate::state::MonitorView::default().transport_hidden;
+        let source = program.clone();
+        assert!(!transport_visible(&program, "playback.loop"));
+        set_transport_visible(&mut program, "playback.loop", true);
+        set_transport_visible(&mut program, "playback.loop", true);
+        assert!(transport_visible(&program, "playback.loop"));
+        assert!(program.is_empty(), "enabling twice must not leave hidden entries");
+        set_transport_visible(&mut program, "playhead.stepForward", false);
+        set_transport_visible(&mut program, "playhead.stepForward", false);
+        assert_eq!(program, vec!["playhead.stepForward"]);
+        assert!(transport_visible(&source, "playhead.stepForward"));
     }
 
     #[test]

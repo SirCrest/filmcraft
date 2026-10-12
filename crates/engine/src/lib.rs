@@ -27,10 +27,12 @@ mod marker_export;
 pub mod masks;
 pub mod media_browser;
 pub mod media_pool;
+pub mod media_watch;
 pub mod mixer;
 pub mod multicam;
 pub mod narration;
 pub mod panels;
+pub mod paste_media;
 pub mod perf;
 pub mod presets;
 pub mod previews;
@@ -57,7 +59,7 @@ use std::sync::Arc;
 
 use filmcraft_edit::EditCtx;
 use filmcraft_project::{ClipId, ItemId, Project, Sequence, TrackId, TrackKind};
-use filmcraft_time::{FrameRate, Tick};
+use filmcraft_time::{FrameRate, Tick, TimeRange};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -190,6 +192,10 @@ impl Services for FsServices {
     }
 }
 
+/// A point in the undo history (its top step), from [`Session::undo_mark`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UndoMark(Option<usize>);
+
 /// Undo history of whole-project snapshots.
 #[derive(Clone, Default)]
 pub struct History {
@@ -221,6 +227,13 @@ pub struct Targeting {
     pub audio_dest: Option<TrackId>,
 }
 
+/// A gap on one track of the active sequence (see [`EditorState::gap_selection`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GapSelection {
+    pub track: TrackId,
+    pub range: TimeRange,
+}
+
 /// Editing state that commands depend on (not project data, but headless-relevant).
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct EditorState {
@@ -230,6 +243,10 @@ pub struct EditorState {
     /// Item loaded in the Source monitor and its playhead (media time).
     pub source_item: Option<ItemId>,
     pub source_playhead: Tick,
+    /// Clips opened in the Source monitor, most recent first: the Source panel's list of recent
+    /// clips (#313). Kept up to date after every command; items gone from the project drop out.
+    #[serde(default)]
+    pub source_history: Vec<ItemId>,
     /// Selected timeline items.
     pub selection: Vec<ClipId>,
     /// Selected project panel items.
@@ -266,6 +283,12 @@ pub struct EditorState {
     /// them. Selecting clips clears it and selecting transitions clears the clip selection.
     #[serde(default)]
     pub transition_selection: Vec<filmcraft_project::TransitionId>,
+    /// The selected gap (#648, #668): empty time on one track, clicked in the Timeline, from the
+    /// end of a clip (or the sequence start) up to the next clip. Delete, Backspace and Ripple
+    /// Delete close it. Selecting clips, transitions or edit points clears it, and so does an edit
+    /// that changes the gap.
+    #[serde(default)]
+    pub gap_selection: Option<GapSelection>,
     /// Selected layers (indices among the graphic layers, 0 = back) of the selected graphic clip.
     #[serde(default)]
     pub graphic_layers: Vec<usize>,
@@ -338,6 +361,9 @@ pub struct Session {
     pub journal: Vec<(String, Value)>,
     /// Background jobs (exports, render previews…).
     pub jobs: Vec<Job>,
+    /// Export job → the offline items it drew the slate for, filled when the export finishes
+    /// (#1054; `offlineMedia` in `file.exportMedia` and queue results).
+    pub export_offline: std::collections::HashMap<u64, Arc<std::sync::Mutex<Vec<media_pool::OfflineMedia>>>>,
     /// User preferences (`prefs.*` commands) and where they persist (None = not persisted).
     pub prefs: autosave::Preferences,
     pub prefs_path: Option<std::path::PathBuf>,
@@ -387,6 +413,11 @@ pub struct Session {
     pub browser: media_browser::BrowserState,
     /// Nesting depth of [`Session::execute`] (commands that run other commands).
     exec_depth: u32,
+    /// Each media file's size and modification time when last seen (Settings ▸ Media ▸
+    /// Automatically refresh growing files, [`media_watch`]).
+    pub media_stamps: std::collections::HashMap<String, media_watch::Stamp>,
+    /// The stamps being taken on a worker thread ([`Session::start_media_scan`]).
+    pub media_scan: Option<media_watch::MediaScan>,
 }
 
 /// An export advanced a batch at a time on the host's thread ([`Session::pump_jobs`]).
@@ -452,6 +483,7 @@ impl Session {
             events: Vec::new(),
             journal: Vec::new(),
             jobs: Vec::new(),
+            export_offline: Default::default(),
             prefs: Default::default(),
             prefs_path: None,
             persistence: None,
@@ -476,6 +508,8 @@ impl Session {
             log: Default::default(),
             browser: Default::default(),
             exec_depth: 0,
+            media_stamps: Default::default(),
+            media_scan: None,
         }
     }
 
@@ -645,6 +679,9 @@ impl Session {
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (spec.run)(self, &params)))
             .unwrap_or_else(|_| Err(EngineError::Other(format!("internal error in `{id}` (see the crash log); the command did not complete"))));
         self.exec_depth -= 1;
+        if self.exec_depth == 0 {
+            source_monitor::track_history(self);
+        }
         // source graphics: an edited instance updates the shared layers and the other instances
         if r.is_ok() && spec.journal && id.starts_with("graphics.") && !self.project.source_graphics.is_empty() {
             graphic_templates::sync_source_graphics(self);
@@ -694,8 +731,11 @@ impl Session {
         }
         let clips = commands::named_clips(self, spec, params);
         let items = commands::named_items(self, spec, params);
+        // clips were named but none is one of the active sequence: say which and why, rather
+        // than "no clips selected" to a caller that did not mean the selection (#591)
+        let missing = if clips.is_none() { commands::named_clips_missing(self, spec, params) } else { None };
         if clips.is_none() && items.is_none() {
-            return by_selection;
+            return by_selection.map_err(|why| missing.unwrap_or(why));
         }
         let mut clips = clips.unwrap_or_else(|| self.state.selection.clone());
         let mut items = items.unwrap_or_else(|| self.state.project_selection.clone());
@@ -704,7 +744,7 @@ impl Session {
         let by_params = (spec.enabled)(self);
         self.state.selection = clips;
         self.state.project_selection = items;
-        by_params
+        by_params.map_err(|why| missing.unwrap_or(why))
     }
 
     /// Whether the command can run on the current selection (what the menus show).
@@ -776,6 +816,7 @@ impl Session {
         self.history.redo.clear();
         self.history.merge_key = None;
         self.state = st;
+        self.drop_stale_gap();
         self.bump();
         Ok(r)
     }
@@ -795,8 +836,39 @@ impl Session {
         self.refuse_self_nesting(&p)?;
         self.project = Arc::new(p);
         self.state = st;
+        self.drop_stale_gap();
         self.bump();
         Ok(r)
+    }
+
+    /// Where the undo history stands now, for [`Session::revert_to`].
+    pub fn undo_mark(&self) -> UndoMark {
+        UndoMark(self.history.undo.last().map(|u| Arc::as_ptr(&u.1) as usize))
+    }
+
+    /// Take back every edit made since `mark` (a gesture cancelled with Escape, #580), merged or
+    /// not: the project returns to how it was at `mark`, and neither undo nor redo keeps them.
+    /// Nothing happens when `mark` has left the history. Returns how many steps were taken back.
+    pub fn revert_to(&mut self, mark: UndoMark) -> usize {
+        if let UndoMark(Some(p)) = mark
+            && !self.history.undo.iter().any(|u| Arc::as_ptr(&u.1) as usize == p)
+        {
+            return 0;
+        }
+        let mut earliest = None;
+        let mut n = 0;
+        while self.undo_mark() != mark {
+            let Some((_, prev)) = self.history.undo.pop() else { break };
+            earliest = Some(prev);
+            n += 1;
+        }
+        if let Some(prev) = earliest {
+            self.project = prev;
+            self.history.merge_key = None;
+            self.fix_state();
+            self.bump();
+        }
+        n
     }
 
     /// Edit the active sequence with the edit-algebra context.
@@ -880,6 +952,7 @@ impl Session {
         {
             self.state.source_item = None;
         }
+        source_monitor::track_history(self);
         if let Some(seq) = self.state.active_sequence.and_then(|s| p.sequence(s)) {
             self.state.selection.retain(|c| seq.find_item(*c).is_some());
             self.state.caption_selection.retain(|c| seq.find_caption(*c).is_some());
@@ -888,6 +961,17 @@ impl Session {
             self.state.caption_selection.clear();
         }
         self.state.project_selection.retain(|i| p.item(*i).is_some());
+        self.drop_stale_gap();
+    }
+
+    /// Forget the selected gap when it is no longer a gap of the active sequence (a clip moved
+    /// into it or next to it, its track went, another sequence became the active one).
+    fn drop_stale_gap(&mut self) {
+        if let Some(g) = self.state.gap_selection
+            && !self.active_sequence().and_then(|q| q.track(g.track)).is_some_and(|tr| filmcraft_edit::through::track_gaps(tr).contains(&g.range))
+        {
+            self.state.gap_selection = None;
+        }
     }
 
     fn bump(&mut self) {
@@ -978,11 +1062,22 @@ impl Session {
 
     /// [`Session::render_program_at`], with the reason when nothing can be rendered.
     pub fn try_render_program_at(&self, scale: f32, t: Tick) -> Result<filmcraft_render::Image> {
+        self.render_program_with(scale, t, &self.media.provider(self.project.clone(), self.services.clone()))
+    }
+
+    /// [`Session::try_render_program_at`], also naming the offline items the frame drew the slate
+    /// for (#1054).
+    pub fn try_render_program_with_offline_at(&self, scale: f32, t: Tick) -> Result<(filmcraft_render::Image, Vec<media_pool::OfflineMedia>)> {
+        let provider = self.media.provider(self.project.clone(), self.services.clone()).recording();
+        let img = self.render_program_with(scale, t, &provider)?;
+        Ok((img, provider.offline_used()))
+    }
+
+    fn render_program_with(&self, scale: f32, t: Tick, provider: &dyn filmcraft_render::SourceProvider) -> Result<filmcraft_render::Image> {
         let seq = self.renderable_sequence(scale)?;
         let t = self.sequence_rate().snap(t.max(Tick::ZERO));
-        let provider = self.media.provider(self.project.clone(), self.services.clone());
         let opts = filmcraft_render::RenderOptions { scale, captions: true, ..Default::default() };
-        Ok(filmcraft_render::render_sequence(&self.project, seq, t, opts, &provider))
+        Ok(filmcraft_render::render_sequence(&self.project, seq, t, opts, provider))
     }
 
     /// The active sequence, if a frame of it at `scale` is within the image size limits.
@@ -1058,6 +1153,8 @@ mod export_tests;
 #[cfg(test)]
 mod file_tests;
 #[cfg(test)]
+mod gap_selection_tests;
+#[cfg(test)]
 mod image_sequence_tests;
 #[cfg(test)]
 mod interchange_auto_points_tests;
@@ -1066,11 +1163,15 @@ mod keyboard_tests;
 #[cfg(test)]
 mod linked_speed_tests;
 #[cfg(test)]
+mod locked_clip_edits_tests;
+#[cfg(test)]
 mod masks_tests;
 #[cfg(test)]
 mod media_browser_tests;
 #[cfg(test)]
 mod media_test_util;
+#[cfg(test)]
+mod media_watch_tests;
 #[cfg(test)]
 mod mixer_tests;
 #[cfg(test)]
@@ -1087,6 +1188,8 @@ mod nesting_tests;
 mod panels_tests;
 #[cfg(test)]
 mod par_tests;
+#[cfg(test)]
+mod paste_media_tests;
 #[cfg(test)]
 mod premiere_tests;
 #[cfg(test)]
@@ -1105,6 +1208,8 @@ mod relink_tests;
 mod remix_tests;
 #[cfg(test)]
 mod ripple_delete_tests;
+#[cfg(test)]
+mod roll_linked_tests;
 #[cfg(test)]
 mod scopes_tests;
 #[cfg(test)]

@@ -26,7 +26,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use filmcraft_export::presets::{DEFAULT_PRESET, preset_key};
-use filmcraft_export::{ExportPreset, ExportSettings, Format, GpuRendering, HardwareEncoding};
+use filmcraft_export::{BitrateMode, ExportPreset, ExportSettings, Format, GpuRendering, HardwareEncoding};
 use filmcraft_project::{ItemId, Project};
 use filmcraft_time::{FrameRate, Tick, TimeRange};
 use serde::{Deserialize, Serialize};
@@ -213,7 +213,13 @@ pub fn settings_from_params(s: &Session, p: &Value, cmd: &str) -> Result<(Option
         settings.max_bitrate_kbps = Some(v);
     }
     if let Some(v) = str_p(p, "bitrateMode") {
-        settings.bitrate_mode = serde_json::from_value(json!(v)).map_err(|_| bad(cmd, "bitrateMode: cbr | vbr1Pass | vbr2Pass"))?;
+        settings.bitrate_mode = serde_json::from_value(json!(v)).map_err(|_| bad(cmd, "bitrateMode: cbr | vbr1Pass | vbr2Pass | crf"))?;
+    }
+    if let Some(v) = f64_p(p, "crf") {
+        settings.crf = v as f32;
+        if p.get("bitrateMode").is_none() {
+            settings.bitrate_mode = BitrateMode::Crf;
+        }
     }
     if let Some(v) = crate::commands::checked_u32_p(p, "keyframeDistance", cmd)? {
         settings.keyframe_distance = Some(v);
@@ -354,7 +360,14 @@ fn file_safe(n: &str) -> String {
 fn with_extension(path: &str, settings: &ExportSettings) -> String {
     let ext = settings.extension();
     match Path::new(path).extension().and_then(|e| e.to_str()) {
-        Some(e) if e.eq_ignore_ascii_case(ext) || (settings.format == Format::TiffSequence && e.eq_ignore_ascii_case("tiff")) => path.to_string(),
+        Some(e)
+            if e.eq_ignore_ascii_case(ext)
+                || (settings.format == Format::TiffSequence && e.eq_ignore_ascii_case("tiff"))
+                || (settings.format == Format::JpegSequence && e.eq_ignore_ascii_case("jpeg"))
+                || (settings.format == Format::Aac && e.eq_ignore_ascii_case("aac")) =>
+        {
+            path.to_string()
+        }
         Some(_) if settings.is_image_sequence() || matches!(settings.format, Format::Aiff) => format!("{}.{ext}", path.rsplit_once('.').map_or(path, |x| x.0)),
         _ => format!("{path}.{ext}"),
     }
@@ -427,8 +440,9 @@ pub fn spawn_export(s: &mut Session, project: Arc<Project>, seq: ItemId, mut set
     let id = s.jobs.iter().map(|j| j.id).max().unwrap_or(0) + 1;
     let job = crate::Job { id, label, progress: Default::default(), result: Default::default() };
     // Export always renders full-resolution media, whatever the proxy toggle says.
-    let provider = s.media.full_res_provider(project.clone(), s.services.clone());
+    let provider = s.media.full_res_provider(project.clone(), s.services.clone()).recording();
     let (prog, res) = (job.progress.clone(), job.result.clone());
+    let offline = s.export_offline.entry(id).or_default().clone();
     if cfg!(target_arch = "wasm32") && !wait && filmcraft_export::stepped(format) {
         // No threads: the host advances the export between UI frames (`Session::pump_jobs`).
         let mut exporter = filmcraft_export::Exporter::new(project, seq, &settings, &prog).map_err(|e| EngineError::Other(e.to_string()))?;
@@ -439,6 +453,7 @@ pub fn spawn_export(s: &mut Session, project: Arc<Project>, seq: ItemId, mut set
     }
     let run = move || {
         let r = filmcraft_export::export(&project, seq, &settings, &provider, &prog).map_err(|e| e.to_string());
+        *offline.lock().unwrap_or_else(|x| x.into_inner()) = provider.offline_used();
         if let Err(e) = &r {
             *prog.error.lock().unwrap_or_else(|x| x.into_inner()) = Some(e.clone());
             prog.finished.store(true, Ordering::Relaxed);
@@ -501,6 +516,7 @@ pub fn export_media(s: &mut Session, p: &Value) -> Result<Value> {
             return Err(EngineError::Other(format!("export failed: {e}")));
         }
         out["result"] = v["result"].clone();
+        out["offlineMedia"] = offline_media_json(s, id);
     }
     Ok(out)
 }
@@ -555,6 +571,22 @@ impl ExportQueue {
     }
 }
 
+/// A `jobs.list` entry: [`crate::Job::to_json`], plus `offlineMedia` for an export job, so callers
+/// that poll an export (the bridge, MCP long exports) can report it like `file.exportMedia` does.
+pub(crate) fn job_json(s: &Session, j: &crate::Job) -> Value {
+    let mut v = j.to_json();
+    if s.export_offline.contains_key(&j.id) {
+        v["offlineMedia"] = offline_media_json(s, j.id);
+    }
+    v
+}
+
+/// The offline items export job `job` drew the slate for, as JSON (`[]` while it runs or when none).
+fn offline_media_json(s: &Session, job: u64) -> Value {
+    let list = s.export_offline.get(&job).map(|o| o.lock().unwrap_or_else(|e| e.into_inner()).clone()).unwrap_or_default();
+    serde_json::to_value(list).unwrap_or_else(|_| json!([]))
+}
+
 fn item_json(s: &Session, it: &QueueItem) -> Value {
     let job = it.job.and_then(|id| s.jobs.iter().find(|j| j.id == id));
     let (progress, status_text) = match job {
@@ -575,6 +607,7 @@ fn item_json(s: &Session, it: &QueueItem) -> Value {
         "statusText": status_text,
         "job": it.job,
         "error": it.error,
+        "offlineMedia": it.job.map_or_else(|| json!([]), |j| offline_media_json(s, j)),
     })
 }
 

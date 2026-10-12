@@ -14,6 +14,10 @@ FilmCraft from an agent. Part 2 covers developing FilmCraft as an agent.
 | Headless | `filmcraft-cli mcp --demo` or `--project p.fcproj` (or a Premiere Pro `p.prproj`; neither = empty project) | an in-process engine session, no window |
 | Bridge | `filmcraft-cli mcp --bridge 127.0.0.1:9876` | the running desktop app started with `filmcraft --control 9876` |
 
+Headless mode also takes `--data-dir DIR` (user presets). Any other option is rejected (exit 2):
+there are no folder-confinement flags such as `--automation-read-root`, so the server can read
+and write wherever the user can.
+
 **Claude Code.** The repository's `.mcp.json` registers both servers (`filmcraft` = bridge,
 `filmcraft-headless` = demo). Both point at `target/release/filmcraft-cli`, so build it first:
 
@@ -106,6 +110,9 @@ progress and stop it:
 
 - The export runs as the same background job `jobs.list` shows. The session is locked only for short
   polls, so other requests (`ping`, `doc_inspect`, `jobs.list`, …) are answered while it encodes.
+- `file.exportMedia` with `wait: true`, an export job in `jobs.list` and each `export.queue.list`
+  item carry `offlineMedia`: the offline items the export drew the placeholder for (see §2b), `[]`
+  when none. The export itself still succeeds; deciding what to do about it is up to the caller.
 - Every job in `jobs.list`, and every encoding item of `export.queue.list`, carries `etaSeconds`: the
   time left at the job's speed over the last 15 seconds, `null` until a second of progress has been
   measured (a loudness pass, a seek) and once it is done. The app shows it as `37% · 2:05 left` in the
@@ -209,6 +216,15 @@ filmcraft-cli --project cut.prproj --save inspect project   # a Premiere Pro pro
 strings; dotted keys nest (`color.r=1`). `run` prints one JSON line per command
 (`{"line","id","ok","result"|"error"}`) and stops at the first failure unless `--keep-going`.
 `--save` writes back to `--project`; `--save-as path` writes elsewhere.
+
+Media that is offline when it is needed (the file is missing, was made offline, or can't be read)
+renders as the "media not found" placeholder. `export` and `render` then name each such item on
+stderr (`item 8 a.mp4 (missing): /path/a.mp4`) and exit 1 after writing the output, so a moved or
+unmounted media folder doesn't pass as a good render. `--allow-offline` accepts the placeholder
+frames: the warning stays and the exit status is 0. The export result lists the same items as
+`offlineMedia` (`[{item, name, path, status, error}]`, `status` as in `media.status`: `missing`,
+`offline` or `unreadable`), and `[]` when every clip it drew was online; check before exporting with
+`exec media.status` or `exec media.findMissing`.
 
 `markers.exportCsv {path}` exports all markers in the active sequence, including colours hidden
 in the UI and markers outside In/Out, sorted by start then id. The UTF-8 CSV has a header and CRLF

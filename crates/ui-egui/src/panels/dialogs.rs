@@ -39,7 +39,7 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
                 .show(ctx, |ui| about(app, ui));
-            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            if crate::widgets::escape_closes(ctx) {
                 open = false;
             }
         }
@@ -104,6 +104,7 @@ fn audio_gain(app: &mut FilmcraftApp, ctx: &egui::Context) -> bool {
         }
     };
     let mut draft = app.ui.audio_gain.clone();
+    crate::widgets::revert_drag_on_escape(ctx, egui::Id::new("audio-gain-before-drag"), &mut draft);
     let mut keep = true;
     let mut apply = false;
     let mut elems: Vec<(String, egui::Rect, String)> = Vec::new();
@@ -153,7 +154,7 @@ fn audio_gain(app: &mut FilmcraftApp, ctx: &egui::Context) -> bool {
     for (id, r, l) in elems {
         app.auto.add(&id, r, &l);
     }
-    if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+    if crate::widgets::escape_closes(ctx) {
         keep = false;
     }
     if apply {
@@ -188,6 +189,7 @@ fn add_tracks(app: &mut FilmcraftApp, ctx: &egui::Context) -> bool {
     let names = |tracks: &[filmcraft_engine::project::Track]| tracks.iter().map(|t| t.name.clone()).collect::<Vec<_>>();
     let (vnames, anames, snames) = (names(&seq.video_tracks), names(&seq.audio_tracks), names(&seq.submix_tracks));
     let mut d = app.ui.add_tracks.clone();
+    crate::widgets::revert_drag_on_escape(ctx, egui::Id::new("add-tracks-before-drag"), &mut d);
     let mut keep = true;
     let mut apply = false;
     let mut elems: Vec<(String, egui::Rect, String)> = Vec::new();
@@ -282,7 +284,7 @@ fn add_tracks(app: &mut FilmcraftApp, ctx: &egui::Context) -> bool {
     for (id, r, l) in elems {
         app.auto.add(&id, r, &l);
     }
-    if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+    if crate::widgets::escape_closes(ctx) {
         keep = false;
     }
     if ctx.input(|i| i.key_pressed(egui::Key::Enter)) && !ctx.egui_wants_keyboard_input() {
@@ -306,18 +308,19 @@ fn add_tracks(app: &mut FilmcraftApp, ctx: &egui::Context) -> bool {
     keep
 }
 
-/// Sequence ▸ Delete Tracks…: "Delete Video Tracks" / "Delete Audio Tracks" checkboxes, each with a
-/// track choice (All Empty Tracks or one track). Returns whether the dialog stays open.
+/// Sequence ▸ Delete Tracks…: "Delete Video Tracks" / "Delete Audio Tracks" (and, when the sequence
+/// has caption tracks, "Delete Caption Tracks") checkboxes, each with a track choice (All Empty
+/// Tracks or one track). Returns whether the dialog stays open.
 ///
-/// Automation ids: `deleteTracks.video`, `deleteTracks.audio` (checkboxes),
-/// `deleteTracks.video.target`, `deleteTracks.audio.target` (track menus),
-/// `deleteTracks.<kind>.option.<empty|V1|A2…>` (menu entries while open), `deleteTracks.ok`,
-/// `deleteTracks.cancel`.
+/// Automation ids: `deleteTracks.video`, `deleteTracks.audio`, `deleteTracks.captions` (checkboxes),
+/// `deleteTracks.<kind>.target` (track menus), `deleteTracks.<kind>.option.<empty|V1|A2|C1…>`
+/// (menu entries while open), `deleteTracks.ok`, `deleteTracks.cancel`.
 fn delete_tracks(app: &mut FilmcraftApp, ctx: &egui::Context) -> bool {
     let Some(seq) = app.session.active_sequence() else { return false };
     let names = |n: usize, p: &str| (1..=n).map(|i| format!("{p}{i}")).collect::<Vec<_>>();
     let vnames = names(seq.video_tracks.len(), "V");
     let anames = names(seq.audio_tracks.len(), "A");
+    let cnames = names(seq.caption_tracks.len(), "C");
     let mut draft = app.ui.delete_tracks.clone();
     let mut keep = true;
     let mut apply = false;
@@ -332,7 +335,11 @@ fn delete_tracks(app: &mut FilmcraftApp, ctx: &egui::Context) -> bool {
             for (kind, title, delete, on, target, list) in [
                 ("video", tl!("Video Tracks"), tl!("Delete Video Tracks"), &mut draft.video, &mut draft.video_target, &vnames),
                 ("audio", tl!("Audio Tracks"), tl!("Delete Audio Tracks"), &mut draft.audio, &mut draft.audio_target, &anames),
+                ("captions", tl!("Caption Tracks"), tl!("Delete Caption Tracks"), &mut draft.captions, &mut draft.captions_target, &cnames),
             ] {
+                if list.is_empty() {
+                    continue;
+                }
                 ui.add_space(4.0);
                 ui.label(egui::RichText::new(title).strong());
                 let label = delete.to_string();
@@ -362,7 +369,7 @@ fn delete_tracks(app: &mut FilmcraftApp, ctx: &egui::Context) -> bool {
                     keep = false;
                 }
                 let o = ui.add_enabled(
-                    draft.video || draft.audio,
+                    draft.video || draft.audio || (draft.captions && !cnames.is_empty()),
                     egui::Button::new(egui::RichText::new(tl!("OK")).color(egui::Color32::WHITE)).fill(app.tokens.accent),
                 );
                 elems.push(("deleteTracks.ok".into(), o.rect, "OK".into()));
@@ -374,7 +381,7 @@ fn delete_tracks(app: &mut FilmcraftApp, ctx: &egui::Context) -> bool {
     for (id, r, l) in elems {
         app.auto.add(&id, r, &l);
     }
-    if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+    if crate::widgets::escape_closes(ctx) {
         keep = false;
     }
     if apply {
@@ -384,6 +391,9 @@ fn delete_tracks(app: &mut FilmcraftApp, ctx: &egui::Context) -> bool {
         }
         if draft.audio {
             p.insert("audio".into(), serde_json::json!(draft.audio_target));
+        }
+        if draft.captions && !cnames.is_empty() {
+            p.insert("captions".into(), serde_json::json!(draft.captions_target));
         }
         if let Err(e) = app.session.execute("sequence.deleteTracks", serde_json::Value::Object(p)) {
             app.ui.status = e.to_string();
@@ -471,7 +481,7 @@ fn about_tab(app: &mut FilmcraftApp, ui: &mut egui::Ui) {
             fg,
         );
         if resp.clicked() {
-            links::open(ui.ctx(), url);
+            links::open(app, ui.ctx(), url);
         }
     };
     link(ui, "discord", Icon::Chat, tl!("Join the ArtCraft Discord"), links::DISCORD, true);

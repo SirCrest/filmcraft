@@ -158,7 +158,7 @@ fn every_panel_opens_from_the_window_menu() {
     let menu = d.ok("ui.menu.list", json!({}));
     let window: Vec<String> =
         menu.as_array().unwrap().iter().filter(|m| m["path"] == json!(["Window"])).filter_map(|m| m["label"].as_str().map(str::to_string)).collect();
-    for p in ["Events", "Lumetri Scopes", "Metadata", "Progress", "Reference Monitor", "Timecode"] {
+    for p in ["Events", "Lumetri Scopes", "Metadata", "Progress", "Project Notes", "Reference Monitor", "Timecode"] {
         assert!(window.iter().any(|w| w == p), "{p} not in Window: {window:?}");
     }
     for (panel, key) in [
@@ -168,6 +168,7 @@ fn every_panel_opens_from_the_window_menu() {
         ("Events", "events.clearAll"),
         ("Progress", "progress.showFinished"),
         ("ReferenceMonitor", "reference.gang"),
+        ("ProjectNotes", "notes.text"),
     ] {
         d.ok("ui.menu.invoke", json!({"id": format!("window.panel.{panel}")}));
         d.frames(3);
@@ -175,6 +176,94 @@ fn every_panel_opens_from_the_window_menu() {
         assert!(!d.ids(key).is_empty(), "{panel}: no {key} widgets");
         assert_eq!(d.ok("ui.inspect", json!({}))["ui"]["focused"], json!(panel));
     }
+}
+
+/// #284 point 3: the panel menu's Maximize Frame keeps the layout (Restore Frame brings it back),
+/// and closing every panel still leaves a dock that Window ▸ can reopen panels into.
+#[test]
+fn panel_menu_maximize_restores_and_an_empty_dock_reopens() {
+    use filmcraft_ui_egui::dock::{DockNode, PanelKind};
+    let mut d = Driver::demo();
+    let layout = d.app().ui.dock.clone();
+    d.click("panel.menu.Program");
+    assert_eq!(d.label("panel.menu.Program.maximize"), "Maximize Frame");
+    d.click("panel.menu.Program.maximize");
+    assert_eq!(d.app().ui.keys.maximized, Some(PanelKind::Program));
+    assert!(!d.has("panel.Timeline"), "only the maximized panel is shown");
+    d.click("panel.menu.Program");
+    assert_eq!(d.label("panel.menu.Program.maximize"), "Restore Frame");
+    d.click("panel.menu.Program.maximize");
+    assert_eq!(d.app().ui.keys.maximized, None);
+    assert_eq!(d.app().ui.dock, layout, "the layout survives maximize / restore");
+    assert!(d.has("panel.Timeline"));
+
+    let mut all = Vec::new();
+    layout.panels(&mut all);
+    for p in all {
+        d.ok("ui.panel.close", json!({"panel": p.id()}));
+    }
+    assert_eq!(d.app().ui.dock, DockNode::Tabs { panels: vec![], active: 0 });
+    d.ok("ui.menu.invoke", json!({"id": "window.panel.Program"}));
+    d.ok("ui.menu.invoke", json!({"id": "window.panel.Timeline"}));
+    d.frames(3);
+    assert!(d.has("panel.tab.Program") && d.has("panel.tab.Timeline"));
+}
+
+/// The wheel over a tab strip switches that group's tab: down = next, up = previous, one tab per
+/// notch, smaller trackpad steps adding up to a notch, stopping at the ends. Over the panel's
+/// content the wheel leaves the tabs alone.
+#[test]
+fn wheel_over_a_tab_strip_switches_tabs() {
+    use filmcraft_ui_egui::dock::{DockNode, PanelKind};
+    fn shown(d: &mut Driver) -> PanelKind {
+        fn find(n: &DockNode) -> Option<PanelKind> {
+            match n {
+                DockNode::Tabs { panels, active } if panels.contains(&PanelKind::Project) => panels.get(*active).copied(),
+                DockNode::Tabs { .. } => None,
+                DockNode::Split { a, b, .. } => find(a).or_else(|| find(b)),
+            }
+        }
+        find(&d.app().ui.dock).unwrap()
+    }
+    fn wheel(d: &mut Driver, dy: f64) {
+        let id = format!("panel.tab.{}", shown(d).id());
+        d.ok("ui.scroll", json!({"id": id, "dy": dy}));
+        d.frames(2);
+    }
+    let mut d = Driver::demo();
+    assert_eq!(shown(&mut d), PanelKind::Project);
+    wheel(&mut d, -40.0);
+    assert_eq!(shown(&mut d), PanelKind::MediaBrowser);
+    wheel(&mut d, 40.0);
+    assert_eq!(shown(&mut d), PanelKind::Project);
+    wheel(&mut d, 120.0);
+    assert_eq!(shown(&mut d), PanelKind::Project, "no wrap past the first tab");
+
+    // a trackpad swipe in small steps moves one tab once the steps add up to a notch
+    let r = d.ok("ui.elements", json!({"prefix": "panel.tab.Project"}))[0]["rect"].clone();
+    let at = egui::pos2((r[0].as_f64().unwrap() + r[2].as_f64().unwrap() / 2.0) as f32, (r[1].as_f64().unwrap() + r[3].as_f64().unwrap() / 2.0) as f32);
+    d.harness.input_mut().events.push(egui::Event::PointerMoved(at));
+    d.frames(1);
+    for step in 0..5 {
+        d.harness.input_mut().events.push(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, -10.0),
+            modifiers: egui::Modifiers::NONE,
+            phase: egui::TouchPhase::Move,
+        });
+        d.frames(1);
+        let expect = if step < 3 { PanelKind::Project } else { PanelKind::MediaBrowser };
+        assert_eq!(shown(&mut d), expect, "after {} pt", (step + 1) * 10);
+    }
+
+    d.ok("ui.scroll", json!({"id": "panel.MediaBrowser", "dy": -40.0}));
+    d.frames(2);
+    assert_eq!(shown(&mut d), PanelKind::MediaBrowser, "the wheel over the content keeps the tab");
+
+    for _ in 0..10 {
+        wheel(&mut d, -40.0);
+    }
+    assert_eq!(shown(&mut d), PanelKind::History, "no wrap past the last tab");
 }
 
 #[test]
@@ -265,6 +354,31 @@ fn metadata_panel_edits_a_field_with_undo() {
     d.exec("metadata.set", json!({"item": item.0, "field": "Tape Name", "value": "A001"}));
     d.frames(2);
     assert_eq!(d.label("metadata.field.TapeName"), "A001");
+}
+
+/// #620: notes typed into Project Notes land in the project; one typing session is one undo step.
+#[test]
+fn project_notes_panel_types_into_the_project_with_undo() {
+    let mut d = Driver::demo();
+    d.ok("ui.menu.invoke", json!({"id": "window.panel.ProjectNotes"}));
+    d.frames(3);
+    let undo0 = d.app().session.history.undo.len();
+    d.click("notes.text");
+    d.ok("ui.type", json!({"text": "Fix logo"}));
+    d.frames(2);
+    d.ok("ui.key", json!({"key": "Enter"}));
+    d.ok("ui.type", json!({"text": "at 1:02"}));
+    d.frames(3);
+    assert_eq!(d.app().session.project.notes, "Fix logo\nat 1:02");
+    assert_eq!(d.app().session.history.undo.len(), undo0 + 1);
+    assert_eq!(d.label("notes.text"), "Fix logo\nat 1:02");
+    d.exec("edit.undo", json!({}));
+    d.frames(2);
+    assert_eq!(d.app().session.project.notes, "");
+    // an agent writes them, the panel shows them
+    d.exec("project.setNotes", json!({"text": "From the script"}));
+    d.frames(2);
+    assert_eq!(d.label("notes.text"), "From the script");
 }
 
 #[test]
@@ -404,5 +518,56 @@ fn scopes_of_colour_bars() {
     for t in filmcraft_scopes::targets(filmcraft_scopes::Matrix::Bt709, 191.0 / 255.0) {
         let a = filmcraft_scopes::angle_deg(t.cb, t.cr) as f64;
         assert!(angles.iter().any(|x| (x - a).abs() < 1.5), "{} at {a:.1}° not in {angles:?}", t.name);
+    }
+}
+
+/// #1075: child backgrounds must not cover the focus outline shared with Program. Check the
+/// rendered primitives, including Media Browser's parent group, in both requested themes.
+#[test]
+fn focused_panel_outline_is_not_covered_by_child_backgrounds() {
+    fn rectangles<'a>(shape: &'a egui::Shape, clip: egui::Rect, out: &mut Vec<(&'a egui::epaint::RectShape, egui::Rect)>) {
+        match shape {
+            egui::Shape::Rect(rect) => out.push((rect, clip)),
+            egui::Shape::Vec(shapes) => shapes.iter().for_each(|shape| rectangles(shape, clip, out)),
+            _ => {}
+        }
+    }
+    let mut d = Driver::demo();
+    for theme in ["dark", "light"] {
+        d.ok("ui.set", json!({"theme": theme}));
+        for panel in ["Program", "Text", "LumetriScopes", "EssentialSound", "Timeline", "TextToSpeech", "MediaBrowser"] {
+            d.ok("ui.panel.show", json!({"panel": panel}));
+            d.ok("ui.set", json!({"focused": panel}));
+            d.frames(3);
+            d.snapshot(&format!("focus-{theme}-{panel}"), None);
+            let mut rects = Vec::new();
+            for shape in &d.harness.output().shapes {
+                rectangles(&shape.shape, shape.clip_rect, &mut rects);
+            }
+            let focus = d.harness.state().tokens.focus;
+            let outlines: Vec<_> = rects
+                .iter()
+                .enumerate()
+                .filter(|(_, (r, _))| r.stroke.color == focus && r.stroke.width == 1.0 && r.rect.width() > 100.0 && r.rect.height() > 80.0)
+                .collect();
+            assert_eq!(outlines.len(), 1, "{theme} {panel}: one focus outline for the whole parent group");
+            let (at, (outline, _)) = outlines[0];
+            let bounds = outline.rect;
+            let strips = [
+                egui::Rect::from_min_max(bounds.min, egui::pos2(bounds.max.x, bounds.min.y + 1.0)),
+                egui::Rect::from_min_max(egui::pos2(bounds.min.x, bounds.max.y - 1.0), bounds.max),
+                egui::Rect::from_min_max(bounds.min, egui::pos2(bounds.min.x + 1.0, bounds.max.y)),
+                egui::Rect::from_min_max(egui::pos2(bounds.max.x - 1.0, bounds.min.y), bounds.max),
+            ];
+            for (child, clip) in &rects[at + 1..] {
+                if child.fill.a() != 0 {
+                    let painted = child.rect.intersect(*clip);
+                    assert!(
+                        strips.iter().all(|edge| !edge.intersect(painted).is_positive()),
+                        "{theme} {panel}: a later child background {painted:?} covers the focus outline {bounds:?}"
+                    );
+                }
+            }
+        }
     }
 }

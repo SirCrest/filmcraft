@@ -347,7 +347,14 @@ fn parse_amount(rest: &str, _lang: Lang) -> Option<(u64, usize, usize, u32, bool
     }
     let major = int_digits.parse::<u64>().ok()?;
     let had_minor = after_decimal && !frac_digits.is_empty();
-    let minor = if had_minor { frac_digits.parse::<u32>().ok()? } else { 0 };
+    // One fractional digit denotes tenths of a major unit (e.g. $1.5 = $1.50),
+    // not five minor units. Preserve the existing two-digit and longer readings.
+    let minor = if had_minor {
+        let value = frac_digits.parse::<u32>().ok()?;
+        if frac_digits.len() == 1 { value * 10 } else { value }
+    } else {
+        0
+    };
     Some((major, int_digits.len(), used, minor, had_minor))
 }
 
@@ -516,11 +523,11 @@ fn english_month(month: u64) -> Option<&'static str> {
 /// `1/2` → "one half"; other small denominators read "N ordinal(s)", anything
 /// bigger reads "N over M".
 fn parse_fraction(rest: &str) -> Option<(Vec<Token>, usize)> {
-    let (n, n_end) = read_u64(rest, 0, 2)?;
+    let (n, n_end) = read_u64(rest, 0, MAX_CARDINAL_DIGITS)?;
     if peek(rest, n_end) != Some('/') || n == 0 {
         return None;
     }
-    let (d, d_end) = read_u64(rest, n_end + 1, 2)?;
+    let (d, d_end) = read_u64(rest, n_end + 1, MAX_CARDINAL_DIGITS)?;
     if d == 0 || peek(rest, d_end).is_some_and(|c| c.is_ascii_alphanumeric() || c == '/') {
         return None;
     }
@@ -580,7 +587,7 @@ fn parse_number_core(rest: &str, lang: Lang) -> Option<(Vec<Token>, usize)> {
         return Some((words, used));
     }
     let value: u64 = digits.parse().ok()?;
-    if let Some((tokens, u)) = parse_continuation(rest, used, value) {
+    if let Some((tokens, u)) = parse_continuation(rest, used, value, &digits) {
         return Some((tokens, u));
     }
     if has_leading_zero_str(&digits) {
@@ -600,14 +607,26 @@ fn has_leading_zero_str(digits: &str) -> bool {
 
 /// `%`, an ordinal suffix (`st`/`nd`/`rd`/`th`), a decimal fraction or `-`-joined
 /// digit groups.
-fn parse_continuation(rest: &str, used: usize, value: u64) -> Option<(Vec<Token>, usize)> {
+/// Percentage sign attached to a number, or separated from it by whitespace.
+fn percent_suffix_len(rest: &str) -> Option<usize> {
+    let suffix = rest.trim_start_matches(char::is_whitespace);
+    suffix.strip_prefix('%').map(|_| rest.len() - suffix.len() + 1)
+}
+
+/// Retain digit-by-digit reading of zero-prefixed integer portions, even when
+/// followed by a percent sign or decimal fraction.
+fn spoken_integer(value: u64, digits: &str) -> Vec<String> {
+    if has_leading_zero_str(digits) { digits.chars().map(|c| english_digit_word(c).into()).collect() } else { english_cardinal(value) }
+}
+
+fn parse_continuation(rest: &str, used: usize, value: u64, digits: &str) -> Option<(Vec<Token>, usize)> {
     let after = rest.get(used..)?;
+    if let Some(suffix_len) = percent_suffix_len(after) {
+        let mut words = spoken_integer(value, digits);
+        words.push("percent".into());
+        return Some((words.into_iter().map(Token::Word).collect(), used + suffix_len));
+    }
     match peek(after, 0) {
-        Some('%') => {
-            let mut words = english_cardinal(value);
-            words.push("percent".into());
-            Some((words.into_iter().map(Token::Word).collect(), used + 1))
-        }
         Some('s' | 'S' | 't' | 'T' | 'n' | 'N' | 'd' | 'D' | 'r' | 'R') => {
             let suffix = after.get(..2)?;
             if is_ordinal_suffix(suffix) && !peek(after, 2).is_some_and(|c| c.is_alphabetic()) {
@@ -616,14 +635,19 @@ fn parse_continuation(rest: &str, used: usize, value: u64) -> Option<(Vec<Token>
             None
         }
         Some('.') if peek(after, 1).is_some_and(|c| c.is_ascii_digit()) => {
-            let mut words = english_cardinal(value);
+            let mut words = spoken_integer(value, digits);
             words.push("point".into());
             let (frac, frac_used) = digit_run_as_words(after.get(1..)?);
             if frac.is_empty() {
                 return None;
             }
             words.extend(frac);
-            Some((words.into_iter().map(Token::Word).collect(), used + 1 + frac_used))
+            let number_end = used + 1 + frac_used;
+            if let Some(suffix_len) = rest.get(number_end..).and_then(percent_suffix_len) {
+                words.push("percent".into());
+                return Some((words.into_iter().map(Token::Word).collect(), number_end + suffix_len));
+            }
+            Some((words.into_iter().map(Token::Word).collect(), number_end))
         }
         Some('-') => parse_digit_groups(rest, used),
         _ => None,
@@ -700,13 +724,17 @@ fn parse_digit_groups(rest: &str, used: usize) -> Option<(Vec<Token>, usize)> {
         }
         return Some((words, end));
     }
-    if groups.len() == 2 && groups.iter().all(|g| g.len() <= 3) {
+    // For shorter non-phone-like groups, retain every group in order. Previously
+    // three original groups ("5-10-15") dropped the middle one by reading only
+    // the first and last endpoints.
+    if groups.iter().all(|g| g.len() <= 3) {
         let a = rest.get(..used)?.parse::<u64>().ok()?;
-        let b_str = groups.last()?;
-        let b = b_str.parse::<u64>().ok()?;
         let mut words = english_cardinal(a);
-        words.push("to".into());
-        words.extend(english_cardinal(b));
+        for group in &groups {
+            let n = group.parse::<u64>().ok()?;
+            words.push("to".into());
+            words.extend(english_cardinal(n));
+        }
         return Some((words.into_iter().map(Token::Word).collect(), end));
     }
     None
@@ -853,8 +881,8 @@ fn english_ordinal(value: u64) -> String {
         "nine" => "ninth",
         "twelve" => "twelfth",
         t if t.ends_with('y') => {
-            let stem = t.get(..t.len() - 1).unwrap_or(t);
-            return format!("{prefix}{stem}ieth");
+            let root = t.get(..t.len() - 1).unwrap_or(t);
+            return attach(stem, &format!("{prefix}{root}ieth"));
         }
         t => return attach(stem, &format!("{prefix}{t}th")),
     };
@@ -1161,10 +1189,39 @@ mod tests {
     }
 
     #[test]
+    fn magnitude_is_kept_before_exact_tens_ordinals() {
+        for lang in [Lang::EnUs, Lang::EnGb] {
+            for (input, expected) in [
+                ("20th", "twentieth"),
+                ("100th", "one hundredth"),
+                ("101st", "one hundred first"),
+                ("119th", "one hundred nineteenth"),
+                ("120th", "one hundred twentieth"),
+                ("130th", "one hundred thirtieth"),
+                ("150th", "one hundred fiftieth"),
+                ("190th", "one hundred ninetieth"),
+                ("1,020th", "one thousand twentieth"),
+                ("1120th", "one thousand one hundred twentieth"),
+                ("121st", "one hundred twenty-first"),
+                ("200th", "two hundredth"),
+            ] {
+                assert_eq!(words(input, lang), expected, "{input:?} {lang:?}");
+            }
+        }
+    }
+
+    #[test]
     fn money() {
         assert_eq!(words("$3.50", Lang::EnUs), "three dollars and fifty cents");
         assert_eq!(words("$1", Lang::EnUs), "one dollar");
         assert_eq!(words("$1.00", Lang::EnUs), "one dollar");
+        assert_eq!(words("$1.5", Lang::EnUs), "one dollar and fifty cents");
+        assert_eq!(words("$2.5", Lang::EnUs), "two dollars and fifty cents");
+        assert_eq!(words("$0.5", Lang::EnUs), "zero dollars and fifty cents");
+        assert_eq!(words("$1.05", Lang::EnUs), "one dollar and five cents");
+        assert_eq!(words("The price is $1.5.", Lang::EnUs), words("The price is $1.50.", Lang::EnUs));
+        assert_eq!(words("£1.5", Lang::EnGb), "one pound and fifty pence");
+        assert_eq!(words("€1.5", Lang::EnUs), "one euro and fifty cents");
         assert_eq!(words("$5.05", Lang::EnUs), "five dollars and five cents");
         assert_eq!(words("$0.75", Lang::EnUs), "zero dollars and seventy-five cents");
         assert_eq!(words("$1,234.56", Lang::EnUs), "one thousand two hundred thirty-four dollars and fifty-six cents");
@@ -1176,10 +1233,36 @@ mod tests {
     }
 
     #[test]
+    fn short_hyphenated_groups_keep_every_number() {
+        for lang in [Lang::EnUs, Lang::EnGb] {
+            assert_eq!(words("1-2-3", lang), "one to two to three");
+            assert_eq!(words("5-10-15", lang), "five to ten to fifteen");
+            assert_eq!(words("10-20-30", lang), "ten to twenty to thirty");
+            assert_eq!(words("1-2-3-4", lang), "one to two to three to four");
+            assert_eq!(words("1-2-3-4-5", lang), "one to two to three to four to five");
+            assert_eq!(words("1-2-3-4-5-6", lang), "one to two to three to four to five to six");
+            assert_eq!(words("2-3", lang), "two to three");
+            assert_eq!(words("10-12", lang), "ten to twelve");
+            assert_eq!(words("555-0134", lang), "five five five zero one three four");
+            assert_eq!(words("005-010-015", lang), "zero zero five zero one zero zero one five");
+        }
+    }
+
+    #[test]
     fn percent() {
         assert_eq!(words("20%", Lang::EnUs), "twenty percent");
         assert_eq!(words("100%", Lang::EnUs), "one hundred percent");
         assert_eq!(words("7%", Lang::EnUs), "seven percent");
+        for lang in [Lang::EnUs, Lang::EnGb] {
+            assert_eq!(words("20.5%", lang), "twenty point five percent");
+            assert_eq!(words("0.5%", lang), "zero point five percent");
+            assert_eq!(words("50 %", lang), "fifty percent");
+            assert_eq!(words("50\t%", lang), "fifty percent");
+            assert_eq!(words("50\u{a0}%", lang), "fifty percent");
+            assert_eq!(words("100 %", lang), "one hundred percent");
+            assert_eq!(words("20.5 %", lang), "twenty point five percent");
+            assert_eq!(words("20.5%", lang), words("twenty point five percent", lang));
+        }
     }
 
     #[test]
@@ -1281,6 +1364,47 @@ mod tests {
         assert_eq!(words("22/7", Lang::EnUs), "twenty-two sevenths");
         assert_eq!(words("5/8", Lang::EnUs), "five eighths");
         assert_eq!(words("7/32", Lang::EnUs), "seven over thirty-two");
+    }
+
+    #[test]
+    fn fraction_operands_may_have_three_digits() {
+        for lang in [Lang::EnUs, Lang::EnGb] {
+            for (input, expected) in [
+                ("7/100", "seven over one hundred"),
+                ("100/7", "one hundred sevenths"),
+                ("7/99", "seven over ninety-nine"),
+                ("99/7", "ninety-nine sevenths"),
+                ("7/0", "seven slash zero"),
+                ("1/2", "one half"),
+                ("3/4", "three quarters"),
+                ("22/7", "twenty-two sevenths"),
+            ] {
+                assert_eq!(words(input, lang), expected, "{input:?} {lang:?}");
+            }
+        }
+        assert_eq!(words("10/7/2026", Lang::EnUs), "October seventh twenty twenty-six");
+        assert_eq!(words("7/10/2026", Lang::EnGb), "the seventh of October twenty twenty-six");
+    }
+
+    #[test]
+    fn percent_and_decimal_suffixes_keep_leading_zeroes() {
+        for lang in [Lang::EnUs, Lang::EnGb] {
+            for (input, expected) in [
+                ("07", "zero seven"),
+                ("007", "zero zero seven"),
+                ("07%", "zero seven percent"),
+                ("007%", "zero zero seven percent"),
+                ("007 %", "zero zero seven percent"),
+                ("07.5", "zero seven point five"),
+                ("007.5", "zero zero seven point five"),
+                ("007.5%", "zero zero seven point five percent"),
+                ("20%", "twenty percent"),
+                ("0.5", "zero point five"),
+                ("0.5%", "zero point five percent"),
+            ] {
+                assert_eq!(words(input, lang), expected, "{input:?} {lang:?}");
+            }
+        }
     }
 
     #[test]

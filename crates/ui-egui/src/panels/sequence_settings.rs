@@ -475,6 +475,7 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) -> bool {
     let audio_samples = app.session.project.settings.audio_display_samples;
     let accent = app.tokens.accent;
     let mut d = app.ui.sequence_settings.clone();
+    crate::widgets::revert_drag_on_escape(ctx, egui::Id::new("sequence-settings-before-drag"), &mut d);
     let mut keep = true;
     let mut apply = false;
     let mut elems: Elems = Vec::new();
@@ -526,7 +527,7 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) -> bool {
     for (id, r, l) in elems {
         app.auto.add(&id, r, &l);
     }
-    if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+    if crate::widgets::escape_closes(ctx) {
         keep = false;
     }
     if ctx.input(|i| i.key_pressed(egui::Key::Enter)) && !ctx.egui_wants_keyboard_input() {
@@ -540,9 +541,12 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) -> bool {
             .and_then(|_| if rest.is_empty() { Ok(Value::Null) } else { app.session.execute("sequence.settings", Value::Object(rest)) });
         if let Err(e) = r {
             app.ui.status = e.to_string();
+            keep = true;
+        } else {
+            keep = false;
         }
         app.ui.sequence_settings = d;
-        return false;
+        return keep;
     }
     if apply {
         let p = changes(&d, &cur, &cur_name);
@@ -551,8 +555,10 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) -> bool {
             && let Err(e) = app.session.execute("sequence.settings", Value::Object(p))
         {
             app.ui.status = e.to_string();
+            keep = true;
+        } else {
+            keep = false;
         }
-        keep = false;
     }
     app.ui.sequence_settings = d;
     keep

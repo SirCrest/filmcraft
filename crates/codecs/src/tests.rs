@@ -229,6 +229,37 @@ fn matroska_prores_pcm() {
     check_mkv("blue_prores_pcm.mkv", &["-c:v", "prores_ks", "-profile:v", "2"], &["-c:a", "pcm_s16le"]);
 }
 
+/// `bytes` with its first `DefaultDuration` element (0x23E383) overwritten by an EBML Void of the
+/// same length, as a muxer that leaves the optional element out would write the track.
+fn without_default_duration(bytes: &[u8]) -> Vec<u8> {
+    let mut out = bytes.to_vec();
+    let at = out.windows(3).position(|w| w == [0x23, 0xE3, 0x83]).expect("DefaultDuration");
+    // ffmpeg writes a one-byte size (0x80 | n)
+    let total = 4 + (out[at + 3] & 0x7F) as usize;
+    out[at] = 0xEC;
+    out[at + 1] = 0x80 | (total - 2) as u8;
+    out[at + 2..at + total].fill(0);
+    out
+}
+
+#[test]
+fn matroska_reordered_video_without_default_duration_keeps_its_rate() {
+    // blocks are in decode order, so B-frames put file neighbours 2–3 frames apart (#923)
+    for (bf, name) in [(0, "rate25_bf0.mkv"), (1, "rate25_bf1.mkv"), (2, "rate25_bf2.mkv")] {
+        let params = format!("bframes={bf}:b-adapt=0:b-pyramid=0:keyint=250:scenecut=0");
+        let args =
+            ["-f", "lavfi", "-i", "testsrc2=size=64x48:rate=25", "-frames:v", "25", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-x264-params", &params, "-an"];
+        let Some(control) = fixture(name, &args) else { return };
+        let stripped = without_default_duration(&control);
+        for (label, bytes) in [("with DefaultDuration", control.to_vec()), ("without", stripped)] {
+            let src = crate::open_bytes(name, bytes.into()).expect("open");
+            let rate = src.info().video.as_ref().expect("video").frame_rate;
+            assert_eq!((rate.num, rate.den), (25, 1), "{bf} B-frames, {label}");
+            assert_eq!(src.info().duration, Tick::from_rational(1, 1, 1), "{bf} B-frames, {label}");
+        }
+    }
+}
+
 /// Path of a fixture under `target/fixtures/codecs/`, generated with ffmpeg when missing
 /// (`None` when ffmpeg or the encoder is unavailable).
 fn fixture_path(name: &str, args: &[&str]) -> Option<PathBuf> {
@@ -385,6 +416,68 @@ fn mkv_vp9_444_12bit_seeks_bit_exact() {
 #[test]
 fn mkv_vp9_422_seeks_bit_exact() {
     check_vp9_seeks("noise_vp9_422.mkv", "Matroska", "yuv422p", &["-profile:v", "1", "-deadline", "realtime", "-speed", "8"], 30);
+}
+
+/// #402: a WebM whose VP9 track carries an alpha layer (`AlphaMode` 1, a second VP9 stream in
+/// each block's `BlockAdditional`) decodes with that alpha. Frames requested out of order (seeks
+/// across key frames, then forward) match libvpx's decode exactly, colour and alpha.
+#[test]
+fn vp9_webm_alpha_layer_matches_libvpx() {
+    let (w, h, frames) = (176usize, 144usize, 30usize);
+    // the alpha changes every frame, so a picture paired with the wrong alpha frame shows
+    let Some(path) = fixture_path(
+        "alpha_vp9.webm",
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=s=176x144:r=25,format=yuva420p,geq=lum='lum(X,Y)':cb='cb(X,Y)':cr='cr(X,Y)':a='mod(X*2+N*7\\,256)'",
+            "-frames:v",
+            "30",
+            "-c:v",
+            "libvpx-vp9",
+            "-pix_fmt",
+            "yuva420p",
+            "-g",
+            "10",
+            "-deadline",
+            "realtime",
+            "-speed",
+            "8",
+            "-b:v",
+            "600k",
+        ],
+    ) else {
+        return;
+    };
+    // the reference: ffmpeg's libvpx decoder (its native VP9 decoder ignores the alpha layer)
+    let src_path = path.to_string_lossy().into_owned();
+    let Some(reference) =
+        fixture("alpha_vp9.webm.yuva420p.yuv", &["-c:v", "libvpx-vp9", "-i", &src_path, "-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", "yuva420p"])
+    else {
+        return;
+    };
+    let (luma, chroma) = (w * h, (w / 2) * (h / 2));
+    let frame_len = luma * 2 + chroma * 2;
+    if reference.len() != frame_len * frames {
+        eprintln!("libvpx reference has {} bytes, not {}; skipping", reference.len(), frame_len * frames);
+        return;
+    }
+    let bytes: Arc<[u8]> = std::fs::read(&path).unwrap().into();
+    let src = crate::open_bytes("alpha_vp9.webm", bytes).unwrap();
+    let info = src.info().clone();
+    assert_eq!(info.container, "WebM");
+    assert!(info.video.as_ref().unwrap().has_alpha);
+    let rate = info.frame_rate();
+    let order: Vec<usize> = [29, 3, 17, 12, 0, 25, 21, 9].into_iter().chain(10..frames).collect();
+    for k in order {
+        let f = src.video_frame(FrameRequest::full(rate.tick_of(k as i64))).unwrap();
+        let r = &reference[k * frame_len..(k + 1) * frame_len];
+        let filmcraft_frame::PixelData::Yuv8 { planes, alpha, .. } = &f.data else { panic!("frame {k}: not 8-bit YUV: {}", f.format_label()) };
+        assert_eq!(planes[0].as_slice(), &r[..luma], "frame {k}: luma");
+        let alpha = alpha.as_ref().unwrap_or_else(|| panic!("frame {k}: no alpha plane"));
+        assert_eq!(alpha.as_slice(), &r[luma + 2 * chroma..], "frame {k}: alpha");
+    }
 }
 
 /// Every sample flagged as sync (as in an MP4 without `stss`): the GOP cache must still start

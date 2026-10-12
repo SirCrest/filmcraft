@@ -1,13 +1,13 @@
 //! Effect masks in the UI: the mask rows of Effect Controls (create ellipse / 4-point polygon /
 //! pen masks, per-mask Path / Feather / Opacity / Expansion / Inverted / mode) and on-monitor
-//! editing on the Program monitor (drag vertices, Bézier handles, the whole mask, feather and
-//! expansion handles; the pen places a free-draw Bézier mask).
+//! editing on the Program monitor (drag vertices, Bézier handles, the whole mask, feather,
+//! expansion and corner-roundness handles; the pen places a free-draw Bézier mask).
 //!
 //! Automation ids: `effectControls.<effect>.mask.{ellipse,polygon,pen}`,
 //! `effectControls.<effect>.mask<k>` (+ `.mode`, `.inverted`, `.delete`, and the parameter rows
 //! `effectControls.<effect>.mask<k>.<param>.*`), `program.mask.vertex.<i>`, `program.mask.in.<i>`,
 //! `program.mask.out.<i>`, `program.mask.body`, `program.mask.feather`, `program.mask.expansion`,
-//! `program.maskPen`.
+//! `program.mask.roundness`, `program.maskPen`.
 
 use egui::{Align2, Color32, Pos2, Rect, Sense, Stroke, pos2, vec2};
 use filmcraft_geom::{Affine, Vec2};
@@ -45,6 +45,7 @@ pub fn effect_rows(
     let t = app.tokens;
     // creation tools: ellipse, 4-point polygon, free-draw Bézier
     let (r, _) = ui.allocate_exact_size(vec2(body.width(), ROW_H), Sense::hover());
+    crate::panels::effect_controls::row_line(ui, r, lane, &t);
     let pen_on = app.ui.mask_pen.as_ref().is_some_and(|p| p.clip == clip.0 && p.effect == idx);
     for (i, (icon, kind, tip)) in [
         (Icon::Ellipse, "ellipse", tl!("Create ellipse mask")),
@@ -85,6 +86,7 @@ pub fn effect_rows(
         } else if resp.hovered() {
             ui.painter().rect_filled(r, 0.0, t.hover);
         }
+        crate::panels::effect_controls::row_line(ui, r, lane, &t);
         let tw = Rect::from_center_size(pos2(r.min.x + 26.0, r.center().y), vec2(10.0, 10.0));
         icons::paint(ui.painter(), tw, if open { Icon::ChevronDown } else { Icon::ChevronRight }, t.text_dim);
         let twresp = ui.interact(tw.expand(3.0), egui::Id::new(("mask-twirl", clip.0, idx, k)), Sense::click());
@@ -99,13 +101,22 @@ pub fn effect_rows(
             Icon::Pen
         };
         icons::paint(ui.painter(), glyph, gi, if selected { t.accent } else { t.text_dim });
-        ui.painter().text(pos2(r.min.x + 54.0, r.center().y), Align2::LEFT_CENTER, &m.name, Tokens::ui(12.0), t.text);
+        // (the mode dropdown starts 118 points from the row's right end)
+        crate::panels::effect_controls::row_label(
+            ui,
+            pos2(r.min.x + 54.0, r.center().y),
+            &m.name,
+            r.max.x - 122.0 - (r.min.x + 54.0),
+            Tokens::ui(12.0),
+            t.text,
+        );
         let base = format!("effectControls.{}.mask{k}", e.effect);
         app.auto.add(&base, r, &m.name);
         // mode
         let mr = Rect::from_min_size(pos2(r.max.x - 118.0, r.min.y + 2.0), vec2(96.0, ROW_H - 4.0));
         let mut mui = ui.new_child(egui::UiBuilder::new().max_rect(mr).layout(egui::Layout::left_to_right(egui::Align::Center)));
         let mut mode = m.mode;
+        crate::panels::effect_controls::fit_to_row(&mut mui);
         egui::ComboBox::from_id_salt(("mask-mode", clip.0, idx, k)).selected_text(crate::i18n::t(mode.label())).width(88.0).show_ui(&mut mui, |ui| {
             for md in MaskMode::ALL {
                 if ui.selectable_value(&mut mode, md, crate::i18n::t(md.label())).changed() {
@@ -148,9 +159,11 @@ pub fn effect_rows(
         }
         // Inverted
         let (r, _) = ui.allocate_exact_size(vec2(body.width(), ROW_H), Sense::hover());
+        crate::panels::effect_controls::row_line(ui, r, lane, &t);
         ui.painter().text(pos2(r.min.x + 40.0, r.center().y), Align2::LEFT_CENTER, tl!("Inverted"), Tokens::ui(12.0), t.text);
         let cr = Rect::from_min_size(pos2(r.min.x + (r.width() * 0.5).max(150.0), r.min.y + 2.0), vec2(20.0, ROW_H - 4.0));
-        let mut cui = ui.new_child(egui::UiBuilder::new().max_rect(cr));
+        let mut cui = ui.new_child(egui::UiBuilder::new().max_rect(cr).layout(egui::Layout::left_to_right(egui::Align::Center)));
+        crate::panels::effect_controls::fit_to_row(&mut cui);
         let mut inv = m.inverted;
         if cui.checkbox(&mut inv, "").changed() {
             actions.push(("masks.set".into(), json!({"clip": clip.0, "effect": idx, "mask": k, "inverted": inv})));
@@ -331,6 +344,8 @@ pub fn monitor_overlay(app: &mut FilmcraftApp, ui: &mut egui::Ui, pic: Rect, fra
             }
         }
     }
+    // ---- corner roundness (masks with sharp corners: rectangles, polygons)
+    actions.extend(roundness_handle(app, ui, &painter, &path, &to_screen, &target));
     // ---- tangent handles and vertices
     let sel_v_id = egui::Id::new(("mask-sel-vertex", sel.clip.0, sel.effect, sel.mask));
     let sel_v: Option<usize> = ui.data(|d| d.get_temp(sel_v_id));
@@ -423,6 +438,121 @@ fn seg_dist(p: Pos2, a: Pos2, b: Pos2) -> f32 {
     (p - (a + ab * t)).length()
 }
 
+/// A sharp corner `masks.roundCorners` can fillet: its point, the unit bisector pointing to the
+/// fillet's centre, `sin(θ/2)` of its opening angle θ, and the largest radius it takes (the fillet
+/// never uses more than half of either edge).
+struct RoundableCorner {
+    p: Vec2,
+    bisector: Vec2,
+    sin_half: f64,
+    max_radius: f64,
+}
+
+/// The corners of `path` that rounding changes (degenerate ones — straight, reversing, zero-length
+/// edges — are left out).
+fn roundable_corners(path: &MaskPath) -> Vec<RoundableCorner> {
+    let n = path.vertices.len();
+    path.roundable_corners()
+        .into_iter()
+        .filter_map(|i| {
+            let v = path.vertices.get(i)?.p;
+            let prev = path.vertices.get((i + n - 1) % n)?.p;
+            let next = path.vertices.get((i + 1) % n)?.p;
+            let (a, b) = (prev - v, next - v);
+            let (la, lb) = (a.length(), b.length());
+            if !(la > 1e-6 && lb > 1e-6) {
+                return None;
+            }
+            let (u, w) = (a * (1.0 / la), b * (1.0 / lb));
+            let theta = (u.x * w.x + u.y * w.y).clamp(-1.0, 1.0).acos();
+            if !(1e-6..std::f64::consts::PI - 1e-6).contains(&theta) {
+                return None;
+            }
+            let s = u + w;
+            let sl = s.length();
+            if !sl.is_finite() || sl <= 1e-9 {
+                return None;
+            }
+            let half = theta / 2.0;
+            let max_radius = la.min(lb) / 2.0 * half.tan();
+            max_radius.is_finite().then_some(RoundableCorner { p: v, bisector: s * (1.0 / sl), sin_half: half.sin(), max_radius })
+        })
+        .collect()
+}
+
+/// Radius of a roundness drag that has moved `dist` clip pixels along the corner's bisector: the
+/// handle follows the fillet's centre, so it sits `r / sin(θ/2)` from the corner.
+fn drag_radius(dist: f64, c: &RoundableCorner, max_radius: f64) -> f64 {
+    let r = dist * c.sin_half;
+    if r.is_finite() { r.clamp(0.0, max_radius.max(0.0)) } else { 0.0 }
+}
+
+/// The corner-roundness handle of the selected mask, just inside its top-left sharp corner.
+/// Dragging it into the shape previews the rounded corners live; releasing rounds every sharp
+/// corner with one `masks.roundCorners` (one undo step per drag). Masks without a sharp corner
+/// between straight edges (ellipses, pen masks, corners already rounded) show no handle.
+fn roundness_handle(
+    app: &mut FilmcraftApp,
+    ui: &mut egui::Ui,
+    painter: &egui::Painter,
+    path: &MaskPath,
+    to_screen: &Affine,
+    target: &Value,
+) -> Option<(String, Value)> {
+    let corners = roundable_corners(path);
+    let to_clip = to_screen.inverse()?;
+    let lin_inv = Affine { e: 0.0, f: 0.0, ..to_clip };
+    let c = corners.iter().min_by(|a, b| {
+        let (pa, pb) = (sp(to_screen, a.p), sp(to_screen, b.p));
+        (pa.x + pa.y).total_cmp(&(pb.x + pb.y))
+    })?;
+    let max_radius = corners.iter().map(|c| c.max_radius).fold(0.0, f64::max);
+    let id = egui::Id::new("mask-roundness");
+    let dist_id = id.with("dist");
+    let dragging = ui.ctx().is_being_dragged(id);
+    let dist: f64 = if dragging { ui.data(|d| d.get_temp(dist_id)).unwrap_or(0.0) } else { 0.0 };
+    let radius = drag_radius(dist, c, max_radius);
+    let anchor = sp(to_screen, c.p);
+    let dir = sp(to_screen, c.p + c.bisector) - anchor;
+    let dir = if dir.length() > 1e-6 { dir.normalized() } else { egui::Vec2::new(1.0, 1.0).normalized() };
+    let hp = sp(to_screen, c.p + c.bisector * (radius / c.sin_half.max(1e-9))) + dir * 18.0;
+    let hr = Rect::from_center_size(hp, vec2(9.0, 9.0));
+    let r = ui.interact(hr.expand(3.0), id, Sense::drag()).on_hover_text(tl!("Drag inward to round the corners"));
+    app.auto.add("program.mask.roundness", hr, "Mask corner roundness");
+    let col = Color32::from_rgb(0x5a, 0xb4, 0xff);
+    if dragging && radius > 0.0 {
+        let preview = path.with_rounded_corners(radius, &path.roundable_corners()).flatten(0.5);
+        painter.add(egui::Shape::closed_line(preview.iter().map(|v| sp(to_screen, *v)).collect(), Stroke::new(1.5, Color32::WHITE)));
+        painter.text(hp + vec2(10.0, -10.0), Align2::LEFT_BOTTOM, format!("{radius:.1}"), Tokens::ui(10.5), app.tokens.hot_text);
+    }
+    painter.line_segment([anchor, hp], Stroke::new(1.0, col.gamma_multiply(0.6)));
+    painter.circle_filled(hp, 4.0, Color32::WHITE);
+    painter.circle_stroke(hp, 4.0, Stroke::new(1.5, col));
+    let primary = egui::PointerButton::Primary;
+    if r.drag_started_by(primary) {
+        ui.data_mut(|d| d.insert_temp(dist_id, 0.0_f64));
+    }
+    if r.dragged_by(primary) && r.drag_delta() != egui::Vec2::ZERO {
+        let d = lin_inv.apply(Vec2::new(r.drag_delta().x as f64, r.drag_delta().y as f64));
+        let along = d.x * c.bisector.x + d.y * c.bisector.y;
+        // accumulate the raw distance: past the limit the handle waits for the pointer to come back
+        let total = ui.data(|m| m.get_temp::<f64>(dist_id)).unwrap_or(0.0) + along;
+        ui.data_mut(|m| m.insert_temp(dist_id, if total.is_finite() { total } else { 0.0 }));
+    }
+    if r.drag_stopped_by(primary) {
+        let dist: f64 = ui.data_mut(|d| d.remove_temp(dist_id)).unwrap_or(0.0);
+        let radius = (drag_radius(dist, c, max_radius) * 10.0).round() / 10.0;
+        if radius > 0.0 {
+            let mut p = target.clone();
+            if let Some(o) = p.as_object_mut() {
+                o.insert("radius".into(), json!(radius));
+            }
+            return Some(("masks.roundCorners".into(), p));
+        }
+    }
+    None
+}
+
 /// Draft vertices → a mask path.
 pub fn draft_path(points: &[[f64; 4]]) -> MaskPath {
     MaskPath {
@@ -451,6 +581,12 @@ fn pen_overlay(app: &mut FilmcraftApp, ui: &mut egui::Ui, pic: Rect, frame: (u32
     let painter = ui.painter().with_clip_rect(pic);
     let to_c = |p: Pos2| to_clip.apply(Vec2::new(p.x as f64, p.y as f64));
     let mut d = draft.clone();
+    // Shift constrains the segment from the previous point (and a dragged-out handle) to 45° steps
+    let shift = ui.input(|i| i.modifiers.shift);
+    let snap = |from: Option<&[f64; 4]>, p: Pos2| match from {
+        Some(q) if shift => constrain_45(sp(&to_screen, Vec2::new(q[0], q[1])), p),
+        _ => p,
+    };
     let mut commit = false;
     let pressed = resp.drag_started() || (resp.clicked() && !ui.data(|m| m.get_temp::<bool>(egui::Id::new("mask-pen-placed")).unwrap_or(false)));
     if pressed && let Some(p) = resp.interact_pointer_pos() {
@@ -458,7 +594,7 @@ fn pen_overlay(app: &mut FilmcraftApp, ui: &mut egui::Ui, pic: Rect, frame: (u32
         if d.points.len() >= 3 && near_first {
             commit = true;
         } else {
-            let c = to_c(p);
+            let c = to_c(snap(d.points.last(), p));
             d.points.push([c.x, c.y, 0.0, 0.0]);
             ui.data_mut(|m| m.insert_temp(egui::Id::new("mask-pen-placed"), resp.drag_started()));
         }
@@ -470,7 +606,7 @@ fn pen_overlay(app: &mut FilmcraftApp, ui: &mut egui::Ui, pic: Rect, frame: (u32
         && !commit
         && let (Some(p), Some(last)) = (resp.interact_pointer_pos(), d.points.last_mut())
     {
-        let c = to_c(p);
+        let c = to_c(snap(Some(last), p));
         let tan = Vec2::new(c.x - last[0], c.y - last[1]);
         if tan.length() > 2.0 {
             last[2] = tan.x;
@@ -491,7 +627,7 @@ fn pen_overlay(app: &mut FilmcraftApp, ui: &mut egui::Ui, pic: Rect, frame: (u32
         painter.add(egui::Shape::line(pts, Stroke::new(1.5, col)));
     }
     if let (Some(h), Some(l)) = (resp.hover_pos(), d.points.last()) {
-        painter.line_segment([sp(&to_screen, Vec2::new(l[0], l[1])), h], Stroke::new(1.0, col.gamma_multiply(0.5)));
+        painter.line_segment([sp(&to_screen, Vec2::new(l[0], l[1])), snap(Some(l), h)], Stroke::new(1.0, col.gamma_multiply(0.5)));
     }
     for (i, q) in d.points.iter().enumerate() {
         let p = sp(&to_screen, Vec2::new(q[0], q[1]));
@@ -534,6 +670,19 @@ fn open_polyline(path: &MaskPath, to_screen: &Affine) -> Vec<Pos2> {
         }
     }
     out
+}
+
+/// `to` moved onto the nearest 45° ray from `from` (horizontal, vertical or diagonal on screen),
+/// keeping its distance along that ray; `to` itself when it coincides with `from` or is not finite.
+fn constrain_45(from: Pos2, to: Pos2) -> Pos2 {
+    let v = to - from;
+    if !(v.x.is_finite() && v.y.is_finite()) || v.length_sq() == 0.0 {
+        return to;
+    }
+    let step = std::f32::consts::FRAC_PI_4;
+    let a = (v.y.atan2(v.x) / step).round() * step;
+    let dir = egui::Vec2::new(a.cos(), a.sin());
+    from + dir * v.dot(dir)
 }
 
 /// The Mask Path row's value area: mask tracking (backward continuously / one frame, forward one
@@ -592,5 +741,26 @@ pub fn path_value(app: &mut FilmcraftApp, ui: &mut egui::Ui, clip: ClipId, effec
         let n = j.progress.total.load(std::sync::atomic::Ordering::Relaxed);
         ui.label(egui::RichText::new(format!("{d}/{n}")).size(10.5).color(t.text_dim));
         ui.ctx().request_repaint();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn constrain_45_snaps_to_the_nearest_eighth_turn() {
+        let o = pos2(10.0, 20.0);
+        let near = |a: Pos2, b: Pos2| (a - b).length() < 1e-3;
+        // nearly horizontal / vertical: the off-axis component goes
+        assert!(near(constrain_45(o, pos2(110.0, 30.0)), pos2(110.0, 20.0)));
+        assert!(near(constrain_45(o, pos2(5.0, -80.0)), pos2(10.0, -80.0)));
+        // nearly diagonal: projected onto the 45° ray
+        let d = constrain_45(o, pos2(60.0, 66.0));
+        assert!(((d.x - o.x) - (d.y - o.y)).abs() < 1e-3, "{d:?}");
+        // degenerate input comes back unchanged
+        assert_eq!(constrain_45(o, o), o);
+        let nan = pos2(f32::NAN, 1.0);
+        assert!(constrain_45(o, nan).x.is_nan());
     }
 }

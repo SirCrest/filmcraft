@@ -263,3 +263,41 @@ fn the_scroll_bar_thumb_follows_the_pointer_and_reaches_both_ends() {
     let (scroll, pps, ..) = d.view();
     assert!(pps < 50.0 && (scroll - at).abs() < 1e-6, "{pps} {scroll}");
 }
+
+/// Show Video Thumbnails ▸ Continuous asks for frames across each video clip, not only its head;
+/// `ui.set` switches the mode (and Off) and refuses an unknown one.
+#[test]
+fn continuous_video_thumbnails_ask_for_frames_across_each_clip() {
+    let mut d = Driver::demo();
+    d.ok("ui.set", json!({"timeline": {"thumbnails": "head", "pps": 50.0, "scroll": 0.0}}));
+    d.view();
+    d.frames(10);
+    let head = d.app().frames.stats().request_misses;
+    d.ok("ui.set", json!({"timeline": {"thumbnails": "continuous"}}));
+    d.frames(3);
+    let continuous = d.app().frames.stats().request_misses;
+    assert!(continuous >= head + 5, "continuous thumbnails queued {} more frames", continuous - head);
+    let tl = d.ok("ui.inspect", none())["ui"]["timeline"].clone();
+    assert_eq!((tl["show_thumbnails"].clone(), tl["thumbnail_mode"].clone()), (json!(true), json!("Continuous")));
+    d.ok("ui.set", json!({"timeline": {"thumbnails": "off"}}));
+    assert!(!d.app().ui.timeline.show_thumbnails);
+    let v = d.call("ui.set", json!({"timeline": {"thumbnails": "filmstrip"}}));
+    assert_eq!(v["ok"], json!(false), "{v}");
+    assert!(!d.app().ui.timeline.show_thumbnails);
+}
+
+#[test]
+fn home_and_end_bring_the_playhead_into_view() {
+    let mut d = Driver::demo();
+    d.ok("ui.set", json!({"timeline": {"pps": 400.0, "scroll": 3.0}}));
+    d.frames(3);
+    d.exec("playhead.start", json!({}));
+    d.frames(3);
+    assert_eq!(d.app().ui.timeline.target_scroll, 0.0, "Home scrolls back to the start");
+    d.exec("playhead.end", json!({}));
+    d.frames(3);
+    let end = d.app().session.playhead().seconds();
+    let v = &d.app().ui.timeline;
+    let width = 1600.0 / v.pps;
+    assert!(v.target_scroll > 3.0 && v.target_scroll <= end && end - v.target_scroll < width, "End shows the playhead: scroll {} end {end}", v.target_scroll);
+}

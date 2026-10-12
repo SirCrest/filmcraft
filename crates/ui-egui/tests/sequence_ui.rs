@@ -321,6 +321,32 @@ fn markers_panel_colour_filter() {
     assert_eq!(d.ids("markers.row.").len(), 2);
 }
 
+/// #695: a marker on the Timeline could not be cleared: with snapping off a click on it left the
+/// playhead on the frame under the pointer, not on the marker Clear Selected Marker looks for, and
+/// right-clicking it opened the clip menu.
+#[test]
+fn a_clicked_timeline_marker_can_be_cleared() {
+    let mut d = Driver::demo();
+    d.exec("markers.clearAll", json!({}));
+    let first = d.exec("markers.add", json!({"frame": 30}))["marker"].as_u64().unwrap();
+    let second = d.exec("markers.add", json!({"frame": 90}))["marker"].as_u64().unwrap();
+    d.exec("sequence.snap", json!({"on": false}));
+    d.exec("playhead.set", json!({"frame": 0}));
+    // zoomed out so that a few px beside a marker is another frame
+    let v = &mut d.app().ui.timeline;
+    (v.pps, v.target_pps, v.scroll, v.target_scroll) = (60.0, 60.0, 0.0, 0.0);
+    d.frames(4);
+    let markers = |d: &mut Driver| d.app().session.active_sequence().unwrap().markers.iter().map(|m| m.id.0).collect::<Vec<_>>();
+    d.ok("ui.click", json!({"id": format!("timeline.marker.{first}"), "fx": 0.95}));
+    d.frames(2);
+    d.exec("markers.clearCurrent", json!({}));
+    assert_eq!(markers(&mut d), vec![second], "the clicked marker is cleared");
+    d.ok("ui.click", json!({"id": format!("timeline.marker.{second}"), "fx": 0.95, "button": "right"}));
+    d.frames(3);
+    d.click("timeline.markerMenu.markers.clearCurrent");
+    assert!(markers(&mut d).is_empty(), "cleared from its context menu");
+}
+
 #[test]
 fn shift_semicolon_goes_to_the_next_gap() {
     let mut d = Driver::demo();
@@ -646,4 +672,27 @@ fn new_sequence_opens_its_dialog() {
     assert_eq!(d.label("sequenceSettings.name"), "Direct");
     assert!(d.ids("sequenceSettings.tab.color").iter().any(|i| i == "sequenceSettings.tab.color"));
     d.click("sequenceSettings.cancel");
+}
+
+/// New Sequence stays open when the engine rejects the frame size so the rest of the draft is not lost.
+#[test]
+fn new_sequence_stays_open_on_invalid_frame_size() {
+    let mut d = Driver::demo();
+    let n0 = d.app().session.project.sequences().count();
+    d.ok("ui.menu.invoke", json!({"id": "file.newSequence"}));
+    d.frames(10);
+    {
+        let s = &mut d.app().ui.sequence_settings;
+        s.name = "Keep Me".into();
+        // within the dialog's per-side range, over the engine's pixel budget
+        (s.width, s.height) = (20_000, 20_000);
+    }
+    d.frames(2);
+    d.click("sequenceSettings.ok");
+    d.frames(2);
+    assert_eq!(d.app().session.project.sequences().count(), n0, "nothing is made");
+    assert!(!d.ids("sequenceSettings.").is_empty(), "dialog stays open: {}", d.app().ui.status);
+    assert_eq!(d.label("sequenceSettings.name"), "Keep Me");
+    assert_eq!(d.label("sequenceSettings.width"), "20000");
+    assert_eq!(d.label("sequenceSettings.height"), "20000");
 }

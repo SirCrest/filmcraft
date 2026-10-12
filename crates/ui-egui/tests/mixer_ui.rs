@@ -21,12 +21,19 @@ struct Driver {
 
 impl Driver {
     fn demo() -> Self {
+        Self::demo_with_step_dt(None)
+    }
+
+    fn demo_with_step_dt(step_dt: Option<f32>) -> Self {
         let mut session = Session::default();
         session.execute("file.openDemoProject", json!({})).expect("demo project");
         let (tx, rx) = channel();
         let app = FilmcraftApp::new(session).with_control(rx);
         let snapshots = std::env::var_os("FILMCRAFT_UI_SNAPSHOT_DIR").map(std::path::PathBuf::from);
         let mut b = Harness::builder().with_size(egui::vec2(1600.0, 980.0)).with_max_steps(10_000);
+        if let Some(dt) = step_dt {
+            b = b.with_step_dt(dt);
+        }
         if snapshots.is_some() {
             b = b.wgpu();
         }
@@ -270,6 +277,27 @@ fn clip_mixer_strips_follow_the_playhead() {
 }
 
 #[test]
+fn clip_mixer_db_value_can_be_typed() {
+    let mut d = Driver::demo();
+    d.ok("ui.panel.show", json!({"panel": "AudioClipMixer"}));
+    d.frames(3);
+    d.exec("playhead.set", json!({"seconds": 1.0}));
+    d.frames(2);
+    d.click("clipMixer.A1.value");
+    d.ok("ui.key", json!({"key": "Cmd+A"}));
+    d.frames(1);
+    d.ok("ui.type", json!({"text": "-20"}));
+    d.frames(2);
+    d.ok("ui.key", json!({"key": "Enter"}));
+    d.frames(3);
+    let seq = d.exec("sequence.inspect", json!({}));
+    let fx = &seq["audio"][0]["items"][0]["effects"];
+    let vol = fx.as_array().unwrap().iter().find(|e| e["effect"] == "volume").unwrap();
+    let level: f64 = vol["params"]["level"]["value"].as_str().and_then(|v| v.strip_prefix("Float(")?.strip_suffix(')')?.parse().ok()).unwrap();
+    assert!((level + 20.0).abs() < 1e-6, "typed -20 dB into the clip mixer readout: {level}");
+}
+
+#[test]
 fn audio_gain_dialog_normalizes_the_selection() {
     let mut d = Driver::demo();
     let seq = d.exec("sequence.inspect", json!({}));
@@ -288,4 +316,41 @@ fn audio_gain_dialog_normalizes_the_selection() {
     let pk = d.exec("clip.audioPeak", json!({"clips": [clip]}));
     assert!(pk["peakDb"].as_f64().unwrap().abs() < 1e-6, "normalized to 0 dB: {pk}");
     assert!(d.ids("audioGain.").is_empty(), "dialog closed");
+}
+
+/// #1062: after Stop, the meter must finish its release without pointer events, then let the
+/// window sleep. Run only frames requested by egui; forcing frames would hide the original bug.
+#[test]
+fn paused_meters_repaint_without_input_and_settle_after_release() {
+    for workspace in ["Editing", "Audio"] {
+        let mut d = Driver::demo_with_step_dt(Some(0.1));
+        d.ok("ui.set", json!({"workspace": workspace}));
+        d.ok("ui.playback", json!({"action": "play"}));
+        d.frames(10);
+        let prefix = if workspace == "Audio" { "mixer.Mix.meter" } else { "audioMeters.channel." };
+        let playing = d.ok("ui.elements", json!({"prefix": prefix}));
+        let labels = |elements: &Value| elements.as_array().unwrap().iter().map(|e| e["label"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+        let active = labels(&playing);
+        assert!(!active.is_empty(), "{workspace}: the meters must be visible");
+        assert!(active.iter().any(|label| !label.contains("-90.0")), "{workspace}: the demo must feed the meters: {active:?}");
+        d.ok("ui.playback", json!({"action": "stop"}));
+        assert!(!d.harness.state().playback.playing);
+        d.snapshot(&format!("meters-{workspace}-paused-start"), None);
+        // Harness::run follows immediate repaint requests, adding no mouse or keyboard input.
+        let steps = d.harness.run();
+        // Inspect both values that drive the bars: a silent level alone must not strand its
+        // slower peak hold. No new frames or pointer events are injected to read this state.
+        let (_, meters): (u64, std::collections::HashMap<u64, Vec<[f32; 2]>>) =
+            d.harness.ctx.data(|data| data.get_temp(egui::Id::new("mixer-meters"))).unwrap();
+        assert!(!meters.is_empty());
+        assert!(meters.values().flatten().all(|meter| *meter == [-90.0; 2]), "{workspace}: meters stopped after {steps} requested frames: {meters:?}");
+        assert_ne!(
+            d.harness.output().viewport_output[&egui::ViewportId::ROOT].repaint_delay,
+            std::time::Duration::ZERO,
+            "{workspace}: silent meters must not keep repainting"
+        );
+        let quiet = d.ok("ui.elements", json!({"prefix": prefix}));
+        assert!(labels(&quiet).iter().all(|label| label.contains("-90.0")), "{workspace}: {:?}", labels(&quiet));
+        d.snapshot(&format!("meters-{workspace}-paused-silent"), None);
+    }
 }

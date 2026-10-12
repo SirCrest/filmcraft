@@ -94,7 +94,7 @@ fn captions(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
             let r = Rect::from_center_size(c + vec2(0.0, 26.0 + i as f32 * 34.0), vec2(200.0, 26.0));
             let resp = ui.interact(r, egui::Id::new(id), Sense::click());
             ui.painter().rect_filled(r, 13.0, if i == 0 { if resp.hovered() { t.accent_hover } else { t.accent } } else { t.field_bg });
-            ui.painter().text(r.center(), Align2::CENTER_CENTER, label, Tokens::semibold(12.0), Color32::WHITE);
+            ui.painter().text(r.center(), Align2::CENTER_CENTER, label, Tokens::semibold(12.0), if i == 0 { Color32::WHITE } else { t.text });
             app.auto.add(id, r, label);
             if resp.clicked() {
                 actions.push((cmd.into(), json!({})));
@@ -233,14 +233,18 @@ fn captions(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
                         }
                         let key = egui::Id::new(("cap-text", c.id.0));
                         let mut buf = ui.data(|d| d.get_temp::<String>(key)).unwrap_or_else(|| c.text.clone());
-                        let resp = ui.add(
-                            egui::TextEdit::multiline(&mut buf)
-                                .id(key.with("te"))
-                                .desired_rows(1)
-                                .desired_width(ui.available_width())
-                                .font(Tokens::ui(12.5))
-                                .frame(egui::Frame::NONE),
-                        );
+                        let resp = if crate::rtl::has_rtl(&buf) && !ui.memory(|m| m.has_focus(key.with("te"))) {
+                            reading_order(ui, &buf, key.with("te"))
+                        } else {
+                            ui.add(
+                                egui::TextEdit::multiline(&mut buf)
+                                    .id(key.with("te"))
+                                    .desired_rows(1)
+                                    .desired_width(ui.available_width())
+                                    .font(Tokens::ui(12.5))
+                                    .frame(egui::Frame::NONE),
+                            )
+                        };
                         app.auto.add(&format!("text.captions.{}.text", c.id.0), resp.rect, "Caption text");
                         if resp.has_focus() {
                             ui.data_mut(|d| d.insert_temp(key, buf.clone()));
@@ -275,6 +279,22 @@ fn captions(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
         }
     });
     run(app, ui, actions);
+}
+
+/// A caption's text in reading order ([`crate::rtl::Lines`]) in place of its `TextEdit`, which
+/// shows right-to-left words in logical order. A click hands focus to the `TextEdit` (`id`), so the
+/// text is edited in logical order and shown in reading order again when the field loses focus.
+fn reading_order(ui: &mut egui::Ui, text: &str, id: egui::Id) -> egui::Response {
+    let margin = vec2(4.0, 2.0); // a TextEdit's own margin, so the text does not move on focus
+    let color = ui.visuals().widgets.inactive.text_color();
+    let width = ui.available_width();
+    let lines = crate::rtl::Lines::new(ui.painter(), text, Tokens::ui(12.5), color, (width - 2.0 * margin.x).max(0.0));
+    let (rect, resp) = ui.allocate_exact_size(vec2(width, lines.size.y + 2.0 * margin.y), Sense::click());
+    lines.paint(ui.painter(), rect.shrink2(margin), color);
+    if resp.clicked() {
+        ui.memory_mut(|m| m.request_focus(id));
+    }
+    resp.on_hover_cursor(egui::CursorIcon::Text)
 }
 
 fn transcript(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
@@ -395,10 +415,30 @@ fn style_strip(app: &mut FilmcraftApp, ui: &mut egui::Ui, r: Rect, track_idx: us
     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(r).id_salt("caption-style"));
     child.horizontal_centered(|ui| {
         ui.spacing_mut().item_spacing.x = 6.0;
+        let r = egui::ComboBox::from_id_salt(("caption-font", tr.id.0)).selected_text(&st.font).width(130.0).height(400.0).show_ui(ui, |ui| {
+            if !filmcraft_text::fonts::system_scanned() {
+                filmcraft_text::fonts::scan_system();
+            }
+            // names starting with '.' are macOS-private system faces (UI/fallback fonts, some without a space glyph)
+            for (f, _) in filmcraft_text::families().into_iter().filter(|(f, _)| !f.starts_with('.')) {
+                let resp = ui.selectable_label(f.eq_ignore_ascii_case(&st.font), &f);
+                // An edge row may be only partly visible; automation must click its visible portion.
+                let visible = resp.rect.intersect(ui.clip_rect());
+                if visible.is_positive() {
+                    app.auto.add(&format!("text.captions.style.font.option.{f}"), visible, &f);
+                }
+                if resp.clicked() {
+                    actions.push(("captions.setStyle".into(), json!({"track": tr.id.0, "font": f})));
+                }
+            }
+        });
+        app.auto.add("text.captions.style.font", r.response.rect, "Caption font");
         let mut size = st.size;
         let resp = ui.add(egui::DragValue::new(&mut size).range(8.0..=200.0).speed(0.5).suffix(" px"));
         app.auto.add("text.captions.style.size", resp.rect, "Caption size");
-        if resp.drag_stopped() || (resp.changed() && !resp.dragged()) {
+        // a drag ended by Escape keeps the size it had (#580)
+        let escaped = resp.drag_stopped() && ui.input(|i| i.key_pressed(egui::Key::Escape));
+        if !escaped && (resp.drag_stopped() || (resp.changed() && !resp.dragged())) {
             actions.push(("captions.setStyle".into(), json!({"track": tr.id.0, "size": size})));
         }
         let mut col = Color32::from_rgba_unmultiplied(st.color[0], st.color[1], st.color[2], st.color[3]);

@@ -1253,6 +1253,10 @@ pub struct Project {
     /// made from, keyed by that item. Schema v14.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub narrations: BTreeMap<ItemId, Narration>,
+    /// Project notes (Window ▸ Project Notes): free plain text kept with the project, for to-dos,
+    /// instructions for whoever opens it next, frame numbers and the like. Schema v15.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub notes: String,
 }
 
 /// How a sequence is shown in the Timeline panel: its zoom, scroll position and track heights.
@@ -1348,6 +1352,7 @@ impl Project {
             search_bins: Vec::new(),
             source_graphics: BTreeMap::new(),
             narrations: BTreeMap::new(),
+            notes: String::new(),
         }
     }
 
@@ -1380,20 +1385,35 @@ impl Project {
         id
     }
 
-    /// Move items into a bin (the root when `bin` is None). Returns how many moved; unknown items
-    /// are skipped. Fails (returns None) when the bin does not exist.
+    /// Move items, and bins named by id, into a bin (the root when `bin` is None). A bin goes with
+    /// everything in it. Returns how many moved; unknown ids are skipped, and so is a bin that
+    /// would land in itself or in one of its own sub-bins. Fails (returns None) when the target
+    /// bin does not exist.
     pub fn move_to_bin(&mut self, items: &[ItemId], bin: Option<BinId>) -> Option<usize> {
         let target = bin.unwrap_or(self.root.id);
         self.root.find_bin(target)?;
         let mut moved = 0;
         for &id in items {
-            if !self.items.contains_key(&id) || !self.root.remove_item(id) {
-                continue;
+            let entry = if self.items.contains_key(&id) {
+                if !self.root.remove_item(id) {
+                    continue;
+                }
+                BinEntry::Item(id)
+            } else {
+                let b = BinId(id.0);
+                // never the root, nor a bin that holds the target (or is it)
+                if b == self.root.id || self.root.find_bin(b).is_none_or(|x| x.find_bin(target).is_some()) {
+                    continue;
+                }
+                let Some(sub) = self.root.remove_bin(b) else { continue };
+                BinEntry::Bin(sub)
+            };
+            match self.root.find_bin_mut(target) {
+                Some(t) => t.children.push(entry),
+                // cannot happen (the target is outside what was taken out), but never lose it
+                None => self.root.children.push(entry),
             }
-            if let Some(b) = self.root.find_bin_mut(target) {
-                b.children.push(BinEntry::Item(id));
-                moved += 1;
-            }
+            moved += 1;
         }
         Some(moved)
     }
@@ -1575,9 +1595,10 @@ impl Project {
         // a multi-camera source sequence edits in as a multi-camera clip showing its first angle
         let multicam =
             it.as_sequence().and_then(|q| q.multicam.as_ref()).map(|m| MulticamSel { enabled: true, angle: m.first_video_angle().unwrap_or(0) as u32 });
-        let source_channels = match (kind, &it.kind) {
-            (TrackKind::Audio, ItemKind::Media(m)) => m.interpret.audio_channels.as_ref().and_then(|a| a.clips.first().cloned()).unwrap_or_default(),
-            _ => Vec::new(),
+        let source_channels = if kind == TrackKind::Audio {
+            self.resolve_media(item).and_then(|(_, m, _)| m.interpret.audio_channels.as_ref()).and_then(|a| a.clips.first().cloned()).unwrap_or_default()
+        } else {
+            Vec::new()
         };
         let id = ClipId(self.alloc_id());
         let dur = seq_rate.snap_nearest(source.duration).max(seq_rate.frame_duration());
@@ -1651,6 +1672,16 @@ fn resolve_auto_points_sized(e: &mut EffectInstance, frame: (u32, u32), source: 
 }
 
 impl Project {
+    /// Available picture and sound, resolving a subclip to its parent media. Missing parents,
+    /// cycles and overly deep subclip chains carry neither stream.
+    pub fn source_streams(&self, item: ItemId) -> (bool, bool) {
+        let Some(pi) = self.item(item) else { return (false, false) };
+        match &pi.kind {
+            ItemKind::Subclip { .. } => self.resolve_media(item).map_or((false, false), |(_, m, _)| (m.info.has_video(), m.info.has_audio())),
+            _ => (pi.has_video(), pi.has_audio()),
+        }
+    }
+
     /// Resolve media through at most sixteen items, preserving the outermost subclip range.
     /// Missing parents, cycles and longer chains are unavailable media.
     pub fn resolve_media(&self, item: ItemId) -> Option<(ItemId, &MediaClip, Option<TimeRange>)> {
@@ -1875,6 +1906,7 @@ mod tests {
     fn media_resolution_bounds_depth_and_preserves_the_outer_range() {
         let (mut p, media, _) = demo_project();
         assert_eq!(p.resolve_media(media).map(|(id, _, range)| (id, range)), Some((media, None)));
+        let streams = p.source_streams(media);
         let mut parent = media;
         let mut last_range = TimeRange::default();
         for n in 0..15 {
@@ -1882,9 +1914,14 @@ mod tests {
             parent = p.add_item("Sub", Label::Iris, ItemKind::Subclip { parent, range: last_range, restrict_trims: false }, None);
         }
         assert_eq!(p.resolve_media(parent).map(|(id, _, range)| (id, range)), Some((media, Some(last_range))));
+        assert_eq!(p.source_streams(parent), streams);
         let too_deep = p.add_item("Too deep", Label::Iris, ItemKind::Subclip { parent, range: last_range, restrict_trims: false }, None);
         assert!(p.resolve_media(too_deep).is_none());
         assert!(p.resolve_media(ItemId(u64::MAX)).is_none());
+        assert_eq!(p.source_streams(too_deep), (false, false));
+        assert_eq!(p.source_streams(ItemId(u64::MAX)), (false, false));
+        p.item_mut(parent).unwrap().kind = ItemKind::Subclip { parent, range: last_range, restrict_trims: false };
+        assert_eq!(p.source_streams(parent), (false, false));
     }
 
     #[test]
@@ -1992,6 +2029,29 @@ mod tests {
         assert_eq!(p.root.parent_of(i), Some(b));
         assert!(p.root.remove_item(i));
         assert_eq!(p.root.parent_of(i), None);
+    }
+
+    #[test]
+    fn a_bin_moves_into_another_bin_with_its_contents() {
+        let mut p = Project::new("x");
+        let outer = p.add_bin("Footage", None);
+        let inner = p.add_bin("B-Roll", None);
+        let deep = p.add_bin("Drone", Some(inner));
+        let i = p.add_item("a", Label::Iris, ItemKind::AdjustmentLayer { width: 10, height: 10, rate: FrameRate::FPS_24, duration: Tick(1) }, Some(deep));
+        assert_eq!(p.move_to_bin(&[ItemId(inner.0)], Some(outer)), Some(1));
+        let o = p.root.find_bin(outer).unwrap();
+        assert!(o.children.iter().any(|c| matches!(c, BinEntry::Bin(b) if b.id == inner)));
+        assert!(!p.root.children.iter().any(|c| matches!(c, BinEntry::Bin(b) if b.id == inner)));
+        assert_eq!(p.root.parent_of(i), Some(deep));
+        assert!(o.find_bin(deep).is_some());
+        // never into itself or its own sub-bin, and the root never moves
+        assert_eq!(p.move_to_bin(&[ItemId(outer.0)], Some(outer)), Some(0));
+        assert_eq!(p.move_to_bin(&[ItemId(outer.0)], Some(deep)), Some(0));
+        assert_eq!(p.move_to_bin(&[ItemId(p.root.id.0)], Some(outer)), Some(0));
+        assert!(p.root.find_bin(outer).unwrap().find_bin(deep).is_some());
+        // and back out to the root
+        assert_eq!(p.move_to_bin(&[ItemId(inner.0)], None), Some(1));
+        assert!(p.root.children.iter().any(|c| matches!(c, BinEntry::Bin(b) if b.id == inner)));
     }
 
     #[test]
