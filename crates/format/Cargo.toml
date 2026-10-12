@@ -14,7 +14,7 @@ filmcraft-project = { workspace = true }
 filmcraft-media = { workspace = true }
 log = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["unbounded_depth"] }
 thiserror = { workspace = true }
 
 [dev-dependencies]

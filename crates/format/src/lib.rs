@@ -15,6 +15,11 @@
 //!   either the old file or the new one, never a torn mix.
 //! - **Auto-save naming/rotation** lives in [`autosave`] (`<name>-YYYY-MM-DD_HH-MM-SS.fcproj` in an
 //!   `Auto-Save` folder next to the project, oldest pruned beyond the version limit).
+//! - **Nesting depth.** Bins nest, and each bin level costs three JSON levels, so serde_json's
+//!   fixed 128-level limit refused projects with bins 42 deep. [`decode`] first measures the
+//!   nesting without recursing and refuses anything deeper than [`MAX_NESTING`], then parses with
+//!   serde_json's limit turned off: bins up to [`MAX_BIN_DEPTH`] deep open, and a hostile file
+//!   cannot overflow the stack (see the crate README).
 //!
 //! Schema history:
 //! - **v1** (M0–M11): the bare serialized `Project` object with a `"version": 1` field.
@@ -65,6 +70,17 @@ pub const SCHEMA_VERSION: u32 = MIGRATIONS.len() as u32 + 1;
 
 /// Oldest schema this build can still upgrade.
 pub const OLDEST_SCHEMA: u32 = 1;
+
+/// Deepest nesting of JSON arrays and objects [`decode`] reads. Parsing costs at most about
+/// 0.85 KB of stack per level (debug build, objects parsed into a `Value`; the typed fast path
+/// about half that), so a document at this limit needs under half of a 1 MiB stack, the smallest
+/// it runs on (the Windows main thread, wasm).
+pub const MAX_NESTING: usize = 512;
+
+/// Deepest bin nesting that stays within [`MAX_NESTING`]: the envelope, `project`, `root` and its
+/// `children` take four levels, each bin three more (`{"Bin": …}`, the bin, its `children`) and
+/// an item entry in the deepest bin one.
+pub const MAX_BIN_DEPTH: usize = (MAX_NESTING - 5) / 3;
 
 #[derive(Debug, thiserror::Error)]
 pub enum FormatError {
@@ -196,19 +212,73 @@ fn probe_version(p: &Probe) -> Result<u32, FormatError> {
 
 /// Read a project file (any supported schema).
 pub fn decode(bytes: &[u8]) -> Result<Loaded, FormatError> {
-    let probe: Probe = serde_json::from_slice(bytes)
-        .map_err(|e| if e.is_syntax() || e.is_eof() { FormatError::Corrupt(e.to_string()) } else { FormatError::NotAProject(e.to_string()) })?;
+    let bytes = Bounded::new(bytes)?;
+    let probe: Probe =
+        bytes.parse().map_err(|e| if e.is_syntax() || e.is_eof() { FormatError::Corrupt(e.to_string()) } else { FormatError::NotAProject(e.to_string()) })?;
     let found = probe_version(&probe)?;
     check_supported(found)?;
     if found == SCHEMA_VERSION {
         // Fast path: deserialize straight into the model.
-        let env: EnvelopeIn = serde_json::from_slice(bytes).map_err(|e| FormatError::Corrupt(e.to_string()))?;
+        let env: EnvelopeIn = bytes.parse().map_err(|e| FormatError::Corrupt(e.to_string()))?;
         return validate_loaded(env.loaded(found));
     }
-    let doc: Value = serde_json::from_slice(bytes).map_err(|e| FormatError::Corrupt(e.to_string()))?;
+    let doc: Value = bytes.parse().map_err(|e| FormatError::Corrupt(e.to_string()))?;
     let doc = migrate_with(MIGRATIONS, doc, found)?;
     let env: EnvelopeIn = serde_json::from_value(doc).map_err(|e| FormatError::Corrupt(format!("after upgrading from schema v{found}: {e}")))?;
     validate_loaded(env.loaded(found))
+}
+
+/// Bytes whose nesting is known to be at most [`MAX_NESTING`], so they can be parsed without
+/// serde_json's fixed recursion limit.
+struct Bounded<'a>(&'a [u8]);
+
+impl<'a> Bounded<'a> {
+    fn new(bytes: &'a [u8]) -> Result<Self, FormatError> {
+        check_nesting(bytes, MAX_NESTING)?;
+        Ok(Self(bytes))
+    }
+
+    /// `serde_json::from_slice` without the 128-level limit.
+    fn parse<T: Deserialize<'a>>(&self) -> serde_json::Result<T> {
+        let mut de = serde_json::Deserializer::from_slice(self.0);
+        de.disable_recursion_limit();
+        let value = T::deserialize(&mut de)?;
+        de.end()?;
+        Ok(value)
+    }
+}
+
+/// Refuse a document whose arrays and objects nest deeper than `limit`. A loop, not recursion,
+/// so the deepest hostile file is just counted. Brackets inside strings do not count; the bytes
+/// need not be valid JSON (the parser reports that), since up to its first error the parser reads
+/// the same structure counted here.
+fn check_nesting(bytes: &[u8], limit: usize) -> Result<(), FormatError> {
+    let (mut depth, mut in_string, mut escaped) = (0usize, false, false);
+    for (at, &b) in bytes.iter().enumerate() {
+        if in_string {
+            match b {
+                _ if escaped => escaped = false,
+                b'\\' => escaped = true,
+                b'"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'[' | b'{' => {
+                depth = depth.saturating_add(1);
+                if depth > limit {
+                    return Err(FormatError::Corrupt(format!(
+                        "data nested more than {limit} levels deep (at byte {at}); FilmCraft opens bins nested up to {MAX_BIN_DEPTH} deep"
+                    )));
+                }
+            }
+            b']' | b'}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// Refuse only values that would overflow or exhaust memory later (`Sequence::check_bounds`);
@@ -503,6 +573,19 @@ mod tests {
         assert!(matches!(decode(br#"{"format":"other","schema_version":1}"#), Err(FormatError::NotAProject(_))));
         let b = encode(&Project::new("x"), false);
         assert!(matches!(decode(&b[..b.len() / 2]), Err(FormatError::Corrupt(_))));
+    }
+
+    /// The nesting count is exact, skips strings (and escaped quotes in them), and the bound
+    /// covers the deepest bin tree it promises.
+    #[test]
+    fn nesting_is_counted_outside_strings() {
+        let nested = |n: usize| format!("{}{}", "[".repeat(n), "]".repeat(n));
+        assert!(check_nesting(nested(MAX_NESTING).as_bytes(), MAX_NESTING).is_ok());
+        assert!(matches!(check_nesting(nested(MAX_NESTING + 1).as_bytes(), MAX_NESTING), Err(FormatError::Corrupt(_))));
+        assert!(check_nesting(br#"[["[[[", "\"[[[", "\\", {"{{": "}}"}]]"#, 3).is_ok());
+        assert!(check_nesting(br#"["\\", [["#, 2).is_err(), "the string ends after an escaped backslash");
+        assert!(check_nesting(br#"]]]]][["#, 2).is_ok(), "stray closers do not go below zero");
+        assert_eq!(5 + 3 * MAX_BIN_DEPTH, MAX_NESTING, "a full bin tree uses the whole budget");
     }
 
     #[test]
